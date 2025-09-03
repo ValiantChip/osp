@@ -3,66 +3,68 @@ package mdns
 import (
 	"log"
 	"net"
-	"time"
+	"strings"
 
 	"github.com/hashicorp/mdns"
 )
 
-const Service = "_googlecast._tcp"
+const Service = "_openscreen._udp."
+
+type Device struct {
+	Names   []string
+	Address net.IP
+}
 
 type Config struct {
 	UseIpv6 bool
 }
 
 type Client struct {
-	config    Config
-	CloseChan chan struct{}
-	devices   []Device
+	config  Config
+	devices []Device
 }
 
 func NewClient() *Client {
-	ch := make(chan struct{}, 1)
 	dv := make([]Device, 0)
 	c := Client{
-		CloseChan: ch,
-		devices:   dv,
+		devices: dv,
 	}
 	return &c
 }
 
-func (c *Client) Close() {
-	c.CloseChan <- struct{}{}
-}
-
 func (c *Client) FindDevices() {
 	resultChan := make(chan *mdns.ServiceEntry, 5)
-	go c.AddDevices(resultChan)
-	go c.DeviceDiscovery(resultChan)
+	go c.addDevices(resultChan)
+	c.deviceDiscovery(resultChan)
 }
 
-func (c *Client) AddDevices(resultChan chan *mdns.ServiceEntry) {
-	for {
-		select {
-		case <-c.CloseChan:
-			return
-		case s := <-resultChan:
-			c.addDevice(s)
-		}
+func (c *Client) addDevices(resultChan chan *mdns.ServiceEntry) {
+	for r := range resultChan {
+		c.addDevice(r)
 	}
 }
 
-func (c *Client) DeviceDiscovery(resultChan chan *mdns.ServiceEntry) {
+func (c *Client) GetAddress(hostName string) net.IP {
+	for _, d := range c.devices {
+		for _, n := range d.Names {
+			if hostName == n || hostName == strings.TrimSuffix(n, Service) {
+				return d.Address
+			}
+		}
+	}
+	return nil
+}
+
+func (c *Client) deviceDiscovery(resultChan chan *mdns.ServiceEntry) {
 	param := mdns.QueryParam{
 		Service:     Service,
 		DisableIPv6: !c.config.UseIpv6,
 		Entries:     resultChan,
-		Timeout:     time.Hour,
 	}
 
 	err := mdns.Query(&param)
 	if err != nil {
 		log.Printf("Querry error %s", err)
-		c.Close()
 	}
 }
 
@@ -103,9 +105,4 @@ func (c *Client) getAddress(s *mdns.ServiceEntry) net.IP {
 
 func (c *Client) Devices() []Device {
 	return c.devices
-}
-
-type Device struct {
-	Names   []string
-	Address net.IP
 }
