@@ -22,6 +22,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"slices"
 	"sync"
 	"time"
 
@@ -36,9 +37,17 @@ import (
 	randutil "github.com/ValiantChip/goutils/rand"
 	osp "github.com/ValiantChip/osp/open_screen"
 	"github.com/ValiantChip/osp/spake2"
+	vint "github.com/ValiantChip/osp/variable_int"
 )
 
-const SERVICE_NAME = "_openscreen._udp."
+var supportedMimeTypes = []string{
+	"video/H264",
+	"video/H265",
+	"video/matroska",
+	"video/mp4",
+}
+
+const SERVICE_NAME = "_openscreen._udp"
 
 type Config struct {
 	DisplayName *string `yaml:"display_name, omitempty"`
@@ -236,6 +245,7 @@ type Server struct {
 	closeChan    chan ClosingError
 	Logger       *serverLogger
 	Player       *vlc.Player
+	MediaPlaying chan struct{}
 }
 
 func (s *Server) Close(err error, code quic.ApplicationErrorCode) {
@@ -286,6 +296,8 @@ type Agent struct {
 	capabilitiesMu     sync.RWMutex
 	clientCapabilities *osp.AuthCapabilities
 	state              osp.RemotePlaybackState
+	loop               bool
+	LoopMu             sync.RWMutex
 	stateMu            sync.RWMutex
 	capabilitiesRecv   chan bool
 	MsgHandler         *osp.MessageHandler
@@ -313,7 +325,23 @@ func (s *Server) NewAgent(conn *quic.Conn) *Agent {
 		a.HandlePresentationStartRequest(msg)
 	})
 
+	a.MsgHandler.AddHandler(osp.RemotePlaybackStartRequestKey, func(msg []byte) {
+		a.HandleRemotePlaybackStartRequest(msg)
+	})
+
 	return a
+}
+
+func (a *Agent) SetLoop(loop bool) {
+	a.LoopMu.Lock()
+	defer a.LoopMu.Unlock()
+	a.loop = loop
+}
+
+func (a *Agent) GetLoop() bool {
+	a.LoopMu.RLock()
+	defer a.LoopMu.RUnlock()
+	return a.loop
 }
 
 func (a *Agent) GetState() osp.RemotePlaybackState {
@@ -355,7 +383,7 @@ func (a *Agent) SetClientInfo(info ClientInfo) {
 func GetAvailabilities(sources []osp.RemotePlaybackSource, stopAtSuccess bool) []osp.UrlAvailability {
 	availabilities := make([]osp.UrlAvailability, 0, len(sources))
 	for _, src := range sources {
-		if !(src.ExtendedMimeType == `application/vnd.apple.mpegurl` || src.ExtendedMimeType == `audio/mpegurl`) {
+		if !slices.Contains(supportedMimeTypes, src.ExtendedMimeType) {
 			availabilities = append(availabilities, osp.Invalid)
 			continue
 		}
@@ -380,45 +408,19 @@ func GetAvailabilities(sources []osp.RemotePlaybackSource, stopAtSuccess bool) [
 
 func HandleAgent(agent *Agent) {
 	defer agent.Conn.CloseWithError(quic.ApplicationErrorCode(0), "agent closed")
-	go agent.Listen()
-
-	msg, err := osp.EncodeMessageWithKey(agent.Server.Capabilities, osp.AuthCapabilitiesKey)
-	if err != nil {
-		agent.Server.Logger.Error(fmt.Sprintf("error encoding capabilities: %s", err.Error()))
-		return
-	}
-
-	err = osp.SendMessage(agent.Conn, msg)
-	if err != nil {
-		agent.Server.Logger.Error(fmt.Sprintf("error sending capabilities: %s", err.Error()))
-		return
-	}
-
-	if agent.GetClientCapabilities() == nil {
-		select {
-		case <-time.After(defaultTimeout):
-			agent.Server.Logger.Error("connection timed out")
-			return
-		case <-agent.capabilitiesRecv:
-			break
-		}
-	}
-
+	agent.Listen()
 	// _, err = agent.Authenticate()
 	// if err != nil {
 	// 	agent.Server.Logger.Error(fmt.Sprintf("authentication failed: %s", err.Error()))
 	// 	return
 	// }
 	// agent.Server.Logger.Info("authentication success")
+}
 
-	remoteStartRequestChan, err := agent.MsgHandler.ListenForKey(osp.RemotePlaybackStartRequestKey)
-	if err != nil {
-		panic(err)
-	}
-
-	msg = <-remoteStartRequestChan
+func (agent *Agent) HandleRemotePlaybackStartRequest(request []byte) {
+	agent.Server.Logger.Info("handling remote playback start request")
 	req := new(osp.RemotePlaybackStartRequest)
-	err = cbor.Unmarshal(msg, req)
+	err := cbor.Unmarshal(request, req)
 	if err != nil {
 		agent.Server.Logger.Error(fmt.Sprintf("error unmarshalling remote playback start request: %s", err.Error()))
 		return
@@ -455,7 +457,7 @@ func HandleAgent(agent *Agent) {
 		State:    &state,
 	}
 
-	msg, _ = osp.EncodeMessageWithKey(rsp, osp.RemotePlaybackStartResponseKey)
+	msg, _ := osp.EncodeMessageWithKey(rsp, osp.RemotePlaybackStartResponseKey)
 	err = osp.SendMessage(agent.Conn, msg)
 	if err != nil {
 		agent.Server.Logger.Error(fmt.Sprintf("error sending remote playback start response: %s", err.Error()))
@@ -497,6 +499,23 @@ func HandleAgent(agent *Agent) {
 	}
 }
 
+var errUnableToLoadMedia = errors.New("unable to load media")
+
+func (s *Server) RequestSource(source osp.RemotePlaybackSource, play chan struct{}) error {
+	for range pointer.ValIfNil(s.Config.MaxRetries, 1) {
+		s.Player.Play()
+		select {
+		case <-time.After(time.Millisecond * time.Duration(pointer.ValIfNil(s.Config.WaitMs, 500))):
+			s.Player.Stop()
+			continue
+		case <-play:
+		}
+		return nil
+	}
+
+	return errUnableToLoadMedia
+}
+
 func (a *Agent) HandleMedia(initcontrols osp.RemotePlaybackControls, initState osp.RemotePlaybackState) osp.RemotePlaybackTerminationEventReason {
 	media, err := a.Server.Player.LoadMediaFromURL(initState.Source.Url)
 	fmt.Println(initState.Source.Url)
@@ -523,7 +542,7 @@ func (a *Agent) HandleMedia(initcontrols osp.RemotePlaybackControls, initState o
 	defer manager.Detach(FreedId)
 
 	EndId, _ := manager.Attach(vlc.MediaPlayerEndReached, func(e vlc.Event, userData interface{}) {
-		close(quit)
+		quit <- struct{}{}
 	}, nil)
 
 	defer manager.Detach(EndId)
@@ -556,32 +575,16 @@ func (a *Agent) HandleMedia(initcontrols osp.RemotePlaybackControls, initState o
 
 	defer manager.Detach(PositionId)
 
-	var success bool = false
-
-	for range pointer.ValIfNil(a.Server.Config.MaxRetries, 1) {
-		a.Server.Player.Play()
-		select {
-		case <-time.After(time.Millisecond * time.Duration(pointer.ValIfNil(a.Server.Config.WaitMs, 500))):
-			a.Server.Player.Stop()
-			continue
-		case <-play:
-			fmt.Println("opening")
-		}
-		success = true
-		break
-	}
-
-	if !success {
-		a.Server.Logger.Error("unable to load media")
-		return osp.UnknownRemotePlaybackTerminationEventReason
-
-	}
+	a.Server.RequestSource(*initState.Source, play)
 
 	a.Server.Logger.Info("here")
 
 	defer a.Server.Player.Stop()
 
-	currentState, _ := HandleControls(initcontrols, a.Server.Player, osp.RemotePlaybackState{}, a.Server.Logger)
+	playerState := a.PlayerState()
+	playerState = osp.MergeStates(playerState, initState)
+
+	currentState, _ := a.HandleControls(initcontrols, playerState, a.Server.Logger)
 
 	a.SetState(currentState)
 
@@ -624,7 +627,7 @@ func (a *Agent) HandleMedia(initcontrols osp.RemotePlaybackControls, initState o
 				continue
 			}
 
-			state, result := HandleControls(req.Controls, a.Server.Player, currentState, a.Server.Logger)
+			state, result := a.HandleControls(req.Controls, currentState, a.Server.Logger)
 
 			currentState = state
 			a.SetState(currentState)
@@ -647,6 +650,10 @@ func (a *Agent) HandleMedia(initcontrols osp.RemotePlaybackControls, initState o
 			return osp.ReceiverCalledTerminate
 
 		case <-quit:
+			if a.GetLoop() {
+				a.Server.Player.SetMediaPosition(0)
+				a.Server.Player.Play()
+			}
 			a.Server.Logger.Info("media quit")
 			return osp.ReceiverCalledTerminate
 		case b := <-pause:
@@ -704,9 +711,30 @@ func (a *Agent) HandleMedia(initcontrols osp.RemotePlaybackControls, initState o
 	}
 }
 
-func HandleControls(controls osp.RemotePlaybackControls, player *vlc.Player, currentState osp.RemotePlaybackState, logger *serverLogger) (state osp.RemotePlaybackState, res osp.Result) {
+func (a *Agent) PlayerState() osp.RemotePlaybackState {
+	state := osp.RemotePlaybackState{}
+
+	length, _ := a.Server.Player.MediaLength()
+	duration := time.Millisecond * time.Duration(length)
+	state.Duration = pointer.New(osp.MediaTimeline(duration.Seconds()))
+
+	playbackRate := a.Server.Player.PlaybackRate()
+	state.PlaybackRate = pointer.New(float64(playbackRate))
+
+	muted, _ := a.Server.Player.IsMuted()
+	state.Muted = pointer.New(muted)
+
+	st, _ := a.Server.Player.MediaState()
+	if st == vlc.MediaPaused {
+		state.Paused = pointer.New(true)
+	}
+	return state
+}
+
+func (a *Agent) HandleControls(controls osp.RemotePlaybackControls, currentState osp.RemotePlaybackState, logger *serverLogger) (state osp.RemotePlaybackState, res osp.Result) {
 	state = currentState
 	res = osp.Success
+	player := a.Server.Player
 
 	if controls.Paused != nil {
 		logger.Info("pausing")
@@ -716,28 +744,52 @@ func HandleControls(controls osp.RemotePlaybackControls, player *vlc.Player, cur
 			if err != nil {
 				logger.Error(fmt.Sprintf("error pausing: %s", err.Error()))
 				res = osp.PermanentError
+				return
 			} else {
 				state.Paused = controls.Paused
 				logger.Info("pause success")
 			}
 		} else {
 			logger.Info("player can't pause")
-			if res == osp.Success {
-				res = osp.PermanentError
-			}
+			res = osp.PermanentError
+			return
 		}
 	}
 
-	if controls.FastSeek != nil {
-		if res == osp.Success {
-			res = osp.PermanentError
+	if controls.Seek != nil || controls.FastSeek != nil {
+		seek := pointer.ValIfNil(controls.Seek, pointer.ValIfNil(controls.FastSeek, osp.MediaTimeline(0)))
+		t := time.Duration(seek) * time.Second
+		logger.Info(fmt.Sprintf("seeking to: %s", t.String()))
+		length, _ := player.MediaLength()
+		err := player.SetMediaPosition(float32(t.Milliseconds()) / float32(length))
+		if err != nil {
+			res = osp.UnknownError
+			return
+		}
+
+		logger.Info("seek success")
+
+		state.Position = pointer.New(seek)
+	}
+
+	if controls.SelectedVideoTrackId != nil {
+		descriptors, _ := player.VideoTrackDescriptors()
+		var success bool = false
+		for _, descriptor := range descriptors {
+			if descriptor.Description == *controls.SelectedVideoTrackId {
+				player.SetVideoTrack(descriptor.ID)
+				success = true
+				break
+			}
+		}
+		if !success {
+			res = osp.TransientError
+			return
 		}
 	}
 
 	if controls.Loop != nil {
-		if res == osp.Success {
-			res = osp.PermanentError
-		}
+		a.SetLoop(*controls.Loop)
 	}
 
 	if controls.Muted != nil {
@@ -758,21 +810,29 @@ func HandleControls(controls osp.RemotePlaybackControls, player *vlc.Player, cur
 	}
 
 	if controls.Preload != nil {
-		if res == osp.Success {
-			res = osp.PermanentError
-		}
+		res = osp.PermanentError
+		return
 	}
 
 	if controls.Source != nil {
-		if res == osp.Success {
+		if slices.Contains(supportedMimeTypes, controls.Source.ExtendedMimeType) {
+			a.Server.Player.Stop()
+			err := a.Server.RequestSource(*controls.Source, a.Server.MediaPlaying)
+			if err != nil {
+				res = osp.UnknownError
+				return
+			} else {
+				a.Server.Player.Play()
+			}
+		} else {
 			res = osp.PermanentError
+			return
 		}
 	}
 
 	if controls.Poster != nil {
-		if res == osp.Success {
-			res = osp.PermanentError
-		}
+		res = osp.PermanentError
+		return
 	}
 
 	return
@@ -941,6 +1001,29 @@ func PrintPassword(pw []byte) {
 }
 
 func (a *Agent) Authenticate() ([]byte, error) {
+
+	msg, err := osp.EncodeMessageWithKey(a.Server.Capabilities, osp.AuthCapabilitiesKey)
+	if err != nil {
+		a.Server.Logger.Error(fmt.Sprintf("error encoding capabilities: %s", err.Error()))
+		return nil, err
+	}
+
+	err = osp.SendMessage(a.Conn, msg)
+	if err != nil {
+		a.Server.Logger.Error(fmt.Sprintf("error sending capabilities: %s", err.Error()))
+		return nil, err
+	}
+
+	if a.GetClientCapabilities() == nil {
+		select {
+		case <-time.After(defaultTimeout):
+			a.Server.Logger.Error("connection timed out")
+			return nil, errors.New("connection timed out")
+		case <-a.capabilitiesRecv:
+			break
+		}
+	}
+
 	var pw []byte
 	var status osp.AuthSpake2PskStatus
 	cap := a.GetClientCapabilities()
@@ -982,7 +1065,7 @@ func (a *Agent) Authenticate() ([]byte, error) {
 		PublicValue: pB.Bytes(),
 	}
 
-	msg, _ := osp.EncodeMessageWithKey(handshake, osp.AuthSpake2HandshakeKey)
+	msg, _ = osp.EncodeMessageWithKey(handshake, osp.AuthSpake2HandshakeKey)
 
 	err = osp.SendMessage(a.Conn, msg)
 	if err != nil {
@@ -1154,7 +1237,7 @@ func MdnsServer(server *Server, logger *serverLogger) (*mdns.Server, error) {
 		return nil, err
 	}
 
-	// mv, _ := vint.EncodeVariableInt30(0)
+	mv, _ := vint.EncodeVariableInt30(0)
 
 	instanceName := InstanceName([]byte(*server.Config.DisplayName))
 
@@ -1170,8 +1253,13 @@ func MdnsServer(server *Server, logger *serverLogger) (*mdns.Server, error) {
 		agentHostName,
 		pointer.ValIfNil(server.Config.Port, 7000),
 		IPs,
-		[]string{"foobar"},
+		[]string{
+			fmt.Sprintf("fp=%s", server.Fingerprint),
+			fmt.Sprintf("mv=%s", mv),
+			fmt.Sprintf("at=%s", server.AuthToken),
+		},
 	)
+
 	if err != nil {
 		panic(err)
 	}

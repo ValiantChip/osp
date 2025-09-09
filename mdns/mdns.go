@@ -1,18 +1,22 @@
 package mdns
 
 import (
-	"log"
+	"fmt"
+	"log/slog"
 	"net"
 	"strings"
+	"time"
 
 	"github.com/hashicorp/mdns"
 )
 
-const Service = "_openscreen._udp."
+const Service = "_openscreen._udp"
 
 type Device struct {
-	Names   []string
-	Address net.IP
+	Names     []string
+	Address   net.IP
+	Port      int
+	AuthToken string
 }
 
 type Config struct {
@@ -22,14 +26,30 @@ type Config struct {
 type Client struct {
 	config  Config
 	devices []Device
+	logger  *slog.Logger
 }
 
-func NewClient() *Client {
+func NewClient(logger *slog.Logger) *Client {
 	dv := make([]Device, 0)
 	c := Client{
 		devices: dv,
+		logger:  logger,
 	}
 	return &c
+}
+
+func FindTxtKey(key string, record []string) (string, bool) {
+	for _, r := range record {
+		kv := strings.Split(r, "=")
+		if kv[0] == key {
+			if len(kv) > 1 {
+				return kv[1], true
+			}
+			return "", true
+		}
+	}
+
+	return "", false
 }
 
 func (c *Client) FindDevices() {
@@ -60,27 +80,35 @@ func (c *Client) deviceDiscovery(resultChan chan *mdns.ServiceEntry) {
 		Service:     Service,
 		DisableIPv6: !c.config.UseIpv6,
 		Entries:     resultChan,
+		Timeout:     10 * time.Second,
 	}
 
 	err := mdns.Query(&param)
 	if err != nil {
-		log.Printf("Querry error %s", err)
+		c.logger.Error(fmt.Sprintf("Querry error %s", err))
 	}
 }
 
 func (c *Client) addDevice(s *mdns.ServiceEntry) {
 	i := c.findDevice(s)
 	if i == -1 {
-		log.Printf("Service %s with name %s not found yet, adding", c.getAddress(s).String(), s.Name)
+		c.logger.Info(fmt.Sprintf("Service %s with name %s not found yet, adding", c.getAddress(s).String(), s.Name))
 		names := []string{s.Name}
 		address := c.getAddress(s)
+		at, exists := FindTxtKey("at", s.InfoFields)
+		if !exists {
+			at = ""
+		}
+
 		d := Device{
-			Names:   names,
-			Address: address,
+			Names:     names,
+			Address:   address,
+			Port:      s.Port,
+			AuthToken: at,
 		}
 		c.devices = append(c.devices, d)
 	} else {
-		log.Printf("Service %s already found, adding additional name %s", c.getAddress(s).String(), s.Name)
+		c.logger.Info(fmt.Sprintf("Service %s already found, adding additional name %s", c.getAddress(s).String(), s.Name))
 
 		c.devices[i].Names = append(c.devices[i].Names, s.Name)
 	}

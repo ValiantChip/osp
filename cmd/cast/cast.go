@@ -1,7 +1,6 @@
-package main
+package cast
 
 import (
-	"bufio"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -15,15 +14,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"math"
 	"math/big"
 	"net"
 	"net/http"
 	"os"
-	"os/exec"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -37,75 +34,74 @@ import (
 
 	"github.com/ValiantChip/goutils/pointer"
 	randutil "github.com/ValiantChip/goutils/rand"
+	cmnd "github.com/ValiantChip/uniCommands"
+	"github.com/gabriel-vasile/mimetype"
 )
 
 var modelName string = "unset"
 
-var folder string = "./chunks"
-
-var defaultTimeout time.Duration = 10 * time.Second
+var defaultTimeout time.Duration = time.Hour
 
 var terminationTimeout time.Duration = time.Second
 
-func main() {
+type Caster struct {
+	client   *Client
+	clientMu sync.RWMutex
+}
 
-	ip := net.ParseIP(os.Args[1])
-	if ip == nil {
-		panic("invalid ip")
+func (c *Caster) GetClient() *Client {
+	c.clientMu.RLock()
+	defer c.clientMu.RUnlock()
+	return c.client
+}
+
+func (c *Caster) SetClient(client *Client) {
+	c.clientMu.Lock()
+	defer c.clientMu.Unlock()
+	c.client = client
+}
+
+func (c *Caster) Cast(ip net.IP, port int, serverPort int, videoPort int, filename string, at string) error {
+	var fl *os.File
+	var err error
+	if fl, err = os.Open(filename); err != nil {
+		slog.Error("failed to open file: %s", "error", err.Error())
+		return errors.New("failed to open file")
 	}
-	port, err := strconv.Atoi(os.Args[2])
+	defer fl.Close()
+
+	mimeType, err := mimetype.DetectReader(fl)
 	if err != nil {
-		panic(err)
+		slog.Error("failed to detect mime type: %s", "error", err.Error())
+		return fmt.Errorf("unable to detect mime type")
 	}
-
-	filename := os.Args[3]
 
 	addr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(ip.String(), strconv.Itoa(port)))
 	if err != nil {
 		panic(err)
 	}
-	udp, err := net.ListenUDP("udp", &net.UDPAddr{Port: 6121})
+	udp, err := net.ListenUDP("udp", &net.UDPAddr{Port: serverPort})
 	if err != nil {
 		panic(err)
 	}
 
-	fmt.Println("starting ffmpeg")
-	os.RemoveAll(folder)
-	os.Mkdir(folder, os.ModePerm)
-	fl, _ := os.Create(folder + "/playlist.m3u8")
-	fl.Close()
-	cmd := exec.CommandContext(context.Background(), "ffmpeg", "-y",
-		"-i", filename,
-		"-preset", "fast",
-		"-threads", "0",
-		"-f", "hls",
-		"-hls_list_size", "0",
-		"-hls_time", "10",
-		"-hls_playlist_type", "event",
-		"-hls_flags", "independent_segments+append_list",
-		"-master_pl_name", "playlist.m3u8",
-		"-hls_segment_filename", folder+`/%v_%03d.ts`, folder+`/%v.m3u8`,
-	)
+	defer udp.Close()
 
-	//_, writer := io.Pipe()
-	// cmd.Stdout = os.Stdout
-	// cmd.Stderr = os.Stderr
-	cmderrchan := make(chan error)
-	go func() { cmderrchan <- cmd.Run() }()
-	defer func() {
-		if cmd.Process != nil {
-			cmd.Process.Kill()
-		}
-	}()
+	slog.Info("starting server")
 
-	fmt.Println("starting server")
+	mux := http.NewServeMux()
+	mux.HandleFunc("/video", func(w http.ResponseWriter, r *http.Request) {
+		http.ServeFile(w, r, filename)
+	})
 
-	http.Handle("/files/", http.StripPrefix(`/files/`, http.FileServer(http.Dir(folder))))
+	svr := &http.Server{Addr: fmt.Sprintf(":%d", videoPort), Handler: mux}
 
 	srverr := make(chan error)
 	go func(errchan chan error) {
-		errchan <- http.ListenAndServe(fmt.Sprintf(":%d", port), nil)
+		errchan <- svr.ListenAndServe()
 	}(srverr)
+
+	defer svr.Shutdown(context.Background())
 
 	serialbase, err := rand.Int(rand.Reader, big.NewInt(math.MaxInt32))
 	if err != nil {
@@ -165,61 +161,44 @@ func main() {
 
 	conn, err := quic.Dial(ctx, udp, addr, tlsconfig, quicConfig)
 	if err != nil {
-		panic(err)
+		slog.Error("quic dial failed", "error", err.Error())
+		return err
 	}
 
 	cId := uuid.New()
 
 	client := MakeClient(fp, conn, osp.AuthCapabilities{}, osp.RemotePlaybackId(cId.ID()))
+
+	c.SetClient(client)
+	defer c.SetClient(nil)
+
 	errchan := make(chan error)
 	go func() { errchan <- client.Listen() }()
 
 	protocolChan := make(chan error)
 
 	go func() {
-		protocolChan <- client.HandleProtocol(port)
+		protocolChan <- client.HandleProtocol(port, videoPort, mimeType.String())
 	}()
 
 	select {
-	case err := <-srverr:
-		fmt.Printf("server shutdown: %v\n", err)
+	case <-srverr:
+		slog.Info("server shutdown")
 		client.Terminate(osp.UnknownTerminationReason)
 	case err := <-errchan:
-		fmt.Printf("client listening shutdown: %v\n", err)
+		slog.Error("client listening shutdown", "error", err)
 		client.Terminate(osp.UnknownTerminationReason)
 	case err := <-protocolChan:
 		if err != nil {
-			fmt.Printf("Protocol error: %v\n", err)
+			slog.Error("Protocol error", "error", err)
 		}
-		fmt.Println("protocol shutdown")
+		slog.Info("protocol shutdown")
 		client.Terminate(osp.UnknownTerminationReason)
 	}
-
-	fmt.Printf("Done\n")
+	return nil
 }
 
-func (client *Client) HandleProtocol(port int) error {
-	msg, err := osp.EncodeMessageWithKey(client.Capabilities, osp.AuthCapabilitiesKey)
-	if err != nil {
-		client.CloseWithError(errors.New("failed to get auth capabilities"), quic.ApplicationErrorCode(quic.ConnectionRefused))
-		return err
-	}
-
-	err = osp.SendMessage(client.Conn, msg)
-	if err != nil {
-		client.CloseWithError(errors.New("failed to send auth capabilities"), quic.ApplicationErrorCode(quic.ConnectionRefused))
-		return err
-	}
-
-	if client.GetAgentCapabilities() == nil {
-		select {
-		case <-time.After(defaultTimeout):
-			client.CloseWithError(errors.New("connection timed out"), quic.ApplicationErrorCode(quic.ConnectionRefused))
-			return errors.New("connection timed out")
-		case <-client.capabilitiesRecv:
-			break
-		}
-	}
+func (client *Client) HandleProtocol(port int, videoPort int, mimeType string) error {
 	// _, err = client.Authenticate()
 	// if err != nil {
 	// 	client.CloseWithError(errors.New("authentication failed: "+err.Error()), quic.ApplicationErrorCode(quic.ConnectionRefused))
@@ -229,24 +208,22 @@ func (client *Client) HandleProtocol(port int) error {
 
 	addrs, err := GetAddresses()
 	if err != nil {
-		fmt.Printf("error getting outbound address: %s\n", err.Error())
+		slog.Error("error getting outbound address", "error", err.Error())
 		return err
 	}
-
-	fmt.Println("got outbound address")
 
 	sources := make([]osp.RemotePlaybackSource, len(addrs))
 	for i, a := range addrs {
 		sources[i] = osp.RemotePlaybackSource{
-			Url:              fmt.Sprintf("http://%s:%d/files/playlist.m3u8", a.String(), port),
-			ExtendedMimeType: "application/vnd.apple.mpegurl",
+			Url:              fmt.Sprintf("http://%s:%d/video", a.String(), videoPort),
+			ExtendedMimeType: mimeType,
 		}
 	}
 
 	startRequestHandler := osp.NewRequestHandler()
 	client.MsgHandler.AddRequestHandler(osp.RemotePlaybackStartResponseKey, startRequestHandler)
 
-	fmt.Println("sending start request")
+	slog.Debug("sending start request")
 	request := osp.RemotePlaybackStartRequest{
 		Request: osp.Request{
 			RequestId: osp.RequestId(uuid.New().ID()),
@@ -256,20 +233,23 @@ func (client *Client) HandleProtocol(port int) error {
 	}
 
 	var response osp.RemotePlaybackStartResponse
-	fmt.Println("sent start request")
+	slog.Debug("sent start request")
 	err = startRequestHandler.SendRequestWithTimeout(client.Conn, request, &response, osp.RemotePlaybackStartRequestKey, defaultTimeout)
 	if err != nil {
-		fmt.Printf("error sending message\n")
+		slog.Error("error sending start request")
 		return err
 	}
-	fmt.Println("got start response")
+	slog.Debug("got start response")
 
 	if response.State == nil {
-		fmt.Printf("request refused\n")
+		slog.Error("request refused")
 		return errors.New("request refused")
 	}
 
 	client.SetState(*response.State)
+
+	client.SetPlaying(true)
+	defer client.SetPlaying(false)
 
 	return client.HandleMedia()
 }
@@ -337,9 +317,14 @@ type Client struct {
 	infoMu            sync.RWMutex
 	agentInfo         osp.AgentInfo
 	MsgHandler        *osp.MessageHandler
+	ControlsHandler   *cmnd.Handler
 	ControlsChan      chan osp.RemotePlaybackControls
 	stateMu           sync.RWMutex
 	state             osp.RemotePlaybackState
+	playing           bool
+	playingMu         sync.RWMutex
+	// ffmpegCmd         *exec.Cmd
+	// ffmpegArgs        []string
 }
 
 func MakeClient(fingerprint string, conn *quic.Conn, capabilities osp.AuthCapabilities, id osp.RemotePlaybackId) *Client {
@@ -355,7 +340,128 @@ func MakeClient(fingerprint string, conn *quic.Conn, capabilities osp.AuthCapabi
 	c.MsgHandler.AddHandler(osp.AuthCapabilitiesKey, func(msg []byte) {
 		c.HandleAuthCapabilities(msg)
 	})
+
+	c.ControlsHandler = cmnd.NewHandler(cmnd.HandlerArg{
+		Name:        "toggle_pause",
+		Description: "toggles if the player is paused",
+		Runner: func(args []string) error {
+			state := c.GetState()
+			c.ControlsChan <- osp.RemotePlaybackControls{Paused: pointer.New(!pointer.ValIfNil(state.Paused, false))}
+			return nil
+		},
+	},
+
+		cmnd.HandlerArg{
+			Name:        "toggle_mute",
+			Description: "toggles if the player is muted",
+			Runner: func(args []string) error {
+				state := c.GetState()
+				c.ControlsChan <- osp.RemotePlaybackControls{Muted: pointer.New(!pointer.ValIfNil(state.Muted, false))}
+				return nil
+			},
+		},
+		cmnd.HandlerArg{
+			Name:        "seek",
+			Description: "Usage: seek <time>\nseek to a specific time in the media: Use HH:MM:SS",
+			Runner: func(args []string) error {
+				t := args[1]
+				//TODO: change time parsing to allow for hours > 24
+				tm, err := time.Parse("15:04:05", t)
+				if err != nil {
+					return errors.New("invalid time format: Use HH:MM:SS")
+				}
+				timeline := osp.MediaTimeline(tm.Second() + tm.Minute()*60 + tm.Hour()*60*60)
+				duration := c.GetState().Duration
+				if duration != nil && timeline > *duration {
+					return errors.New("cannot seek to a time after the end of the media")
+				}
+				c.ControlsChan <- osp.RemotePlaybackControls{FastSeek: pointer.New(timeline)}
+				return nil
+			},
+		},
+		cmnd.HandlerArg{
+			Name:        "current_position",
+			Description: "print the current position of the player that is playing the cast media",
+			Runner: func(args []string) error {
+				position := c.GetState().Position
+				if position == nil {
+					slog.Error("position is nil")
+					fmt.Println("no position has been set")
+					return nil
+				}
+
+				t := time.Second * time.Duration(*position)
+
+				fmt.Println(ParseDuration(t))
+
+				return nil
+			},
+		},
+		cmnd.HandlerArg{
+			Name:        "media_duration",
+			Description: "print the duration of the media that is casting",
+			Runner: func(args []string) error {
+				duration := c.GetState().Duration
+				if duration == nil {
+					slog.Error("duration is nil")
+					fmt.Println("no duration has been set")
+					return nil
+				}
+
+				t := time.Second * time.Duration(*duration)
+
+				fmt.Println(ParseDuration(t))
+
+				return nil
+			},
+		},
+		cmnd.HandlerArg{
+			Name:        "set_volume",
+			Description: "Usage: set_volume <0-100>\nsets the volume of the media player",
+			Runner: func(args []string) error {
+				vol, err := strconv.Atoi(args[1])
+				if err != nil {
+					return errors.New("invalid volume")
+				}
+				if vol < 0 || vol > 100 {
+					return errors.New("volume must be between 0 and 100")
+				}
+				c.ControlsChan <- osp.RemotePlaybackControls{Volume: pointer.New(float64(vol) / 100.0)}
+				return nil
+			},
+		},
+		cmnd.HandlerArg{
+			Name:        "quit",
+			Description: "terminate the player and stop casting",
+			Runner: func(args []string) error {
+				c.Terminate(osp.UserTerminatedViaController)
+				return nil
+			},
+		},
+
+		cmnd.HandlerArg{
+			Name:        "help",
+			Description: "print this message",
+			Runner: func(args []string) error {
+				fmt.Println("Available commands:")
+				fmt.Print(c.ControlsHandler.GetDescription())
+				return nil
+			},
+		},
+	)
 	return c
+}
+
+func (c *Client) IsPlaying() bool {
+	c.playingMu.RLock()
+	defer c.playingMu.RUnlock()
+	return c.playing
+}
+
+func (c *Client) SetPlaying(playing bool) {
+	c.playingMu.Lock()
+	defer c.playingMu.Unlock()
+	c.playing = playing
 }
 
 func (c *Client) GetState() osp.RemotePlaybackState {
@@ -405,7 +511,7 @@ func (c *Client) SetAgentInfo(info osp.AgentInfo) {
 
 func (c *Client) CloseWithError(err error, code quic.ApplicationErrorCode) {
 	c.Conn.CloseWithError(quic.ApplicationErrorCode(code), err.Error())
-	log.Fatalf("%s\n", err.Error())
+	slog.Error(fmt.Sprintf("%s\n", err.Error()))
 }
 
 func (c *Client) HandleAuthCapabilities(buff []byte) {
@@ -433,6 +539,27 @@ func PrintPassword(pw []byte) {
 }
 
 func (c *Client) Authenticate() ([]byte, error) {
+	msg, err := osp.EncodeMessageWithKey(c.Capabilities, osp.AuthCapabilitiesKey)
+	if err != nil {
+		c.CloseWithError(errors.New("failed to get auth capabilities"), quic.ApplicationErrorCode(quic.ConnectionRefused))
+		return nil, err
+	}
+
+	err = osp.SendMessage(c.Conn, msg)
+	if err != nil {
+		c.CloseWithError(errors.New("failed to send auth capabilities"), quic.ApplicationErrorCode(quic.ConnectionRefused))
+		return nil, err
+	}
+
+	if c.GetAgentCapabilities() == nil {
+		select {
+		case <-time.After(defaultTimeout):
+			c.CloseWithError(errors.New("connection timed out"), quic.ApplicationErrorCode(quic.ConnectionRefused))
+			return nil, errors.New("connection timed out")
+		case <-c.capabilitiesRecv:
+			break
+		}
+	}
 	var pw []byte
 	var status osp.AuthSpake2PskStatus
 	cap := c.GetAgentCapabilities()
@@ -469,7 +596,7 @@ func (c *Client) Authenticate() ([]byte, error) {
 		PskStatus:   status,
 		PublicValue: pA.Bytes(),
 	}
-	msg, err := osp.EncodeMessageWithKey(handshake, osp.AuthSpake2HandshakeKey)
+	msg, err = osp.EncodeMessageWithKey(handshake, osp.AuthSpake2HandshakeKey)
 	if err != nil {
 		return []byte{}, err
 	}
@@ -534,30 +661,24 @@ func (c *Client) Authenticate() ([]byte, error) {
 	return Ke, nil
 }
 
-func (c *Client) HandleControls() osp.RemotePlaybackTerminationRequestReason {
-	scanner := bufio.NewScanner(os.Stdin)
-	for scanner.Scan() {
-		cmd := strings.Split(scanner.Text(), " ")
-		cont := osp.RemotePlaybackControls{}
-		switch cmd[0] {
-		case "toggle_pause":
-			state := c.GetState()
-			cont.Paused = pointer.New(!pointer.ValIfNil(state.Paused, false))
-		case "toggle_mute":
-			state := c.GetState()
-			cont.Muted = pointer.New(!pointer.ValIfNil(state.Muted, false))
-		case "quit":
-			return osp.UserTerminatedViaController
-		default:
-			log.Println("command not recognized")
-			continue
-		}
-
-		fmt.Printf("Sending controls\n")
-		c.ControlsChan <- cont
+func (c *Client) HandleControl(cmd []string) error {
+	if !c.IsPlaying() {
+		return errors.New("nothing is playing right now")
+	}
+	err, ok := c.ControlsHandler.HandleArgs(cmd)
+	if !ok {
+		fmt.Println("Command not recognized: available commands:")
+		fmt.Print(c.ControlsHandler.GetDescription())
+		return nil
 	}
 
-	return osp.UnknownTerminationReason
+	if err != nil {
+		return err
+	}
+
+	slog.Debug("sending controls")
+
+	return nil
 }
 
 func (c *Client) HandleMedia() error {
@@ -567,8 +688,6 @@ func (c *Client) HandleMedia() error {
 	rchan := make(chan osp.RemotePlaybackTerminationRequestReason)
 	terminationChan := make(chan struct{})
 	go func() { retchan <- PlayMedia(c, *time.NewTicker(time.Second), statechan, terminationChan, updatechan) }()
-
-	go func() { rchan <- c.HandleControls() }()
 
 	defer close(terminationChan)
 
@@ -596,10 +715,10 @@ func (c *Client) HandleMedia() error {
 	for {
 		select {
 		case err := <-retchan:
-			fmt.Println("got return")
+			slog.Debug("got return")
 			return err
 		case cont := <-c.ControlsChan:
-			fmt.Println("got controls")
+			slog.Debug("got controls")
 			req := osp.RemotePlaybackModifyRequest{
 				Request: osp.Request{
 					RequestId: osp.RequestId(uuid.New().ID()),
@@ -609,34 +728,28 @@ func (c *Client) HandleMedia() error {
 			}
 
 			if cont.Paused != nil {
-				log.Printf("paused: %v", *cont.Paused)
+				slog.Info(fmt.Sprintf("paused: %v", *cont.Paused))
 			}
 
 			if cont.Muted != nil {
-				log.Printf("muted: %v", *cont.Muted)
+				slog.Info(fmt.Sprintf("muted: %v", *cont.Muted))
 			}
 
 			var modr osp.RemotePlaybackModifyResponse
-			fmt.Println("sent modify request")
+			slog.Debug("sent modify request")
 			err := modifyRequestHandler.SendRequestWithTimeout(c.Conn, req, &modr, osp.RemotePlaybackModifyRequestKey, defaultTimeout)
 			if err != nil {
 				return errors.Join(errors.New("error sending modify request"), err)
 			}
 
-			if modr.State.Paused != nil {
-				log.Printf("modr paused: %v", *modr.State.Paused)
-			} else {
-				log.Printf("modr paused is nil")
-			}
-
 			if modr.Result != osp.Success {
-				log.Println("modify request failed")
+				slog.Error("modify request failed")
 				break
 			}
 
 			c.MergeState(pointer.ZeroIfNil(modr.State))
 
-			fmt.Println("sent state")
+			slog.Debug("sent state")
 			statechan <- c.GetState()
 		case s := <-stateEventChan:
 			event := new(osp.RemotePlaybackStateEvent)
@@ -650,17 +763,17 @@ func (c *Client) HandleMedia() error {
 		case u := <-updatechan:
 			c.MergeState(u)
 		case term := <-terminationEventChan:
-			fmt.Println("got termination event")
+			slog.Debug("got termination event")
 			t := osp.RemotePlaybackTerminationEvent{}
 			err := cbor.Unmarshal(term, &t)
 			if err != nil {
 				return errors.Join(errors.New("error unmarshalling termination event"), err)
 			}
 
-			fmt.Printf("Terminated: Reason: %d", t.Reason)
+			slog.Info("Terminated: Reason: %d", "reason", t.Reason)
 			return nil
 		case reason := <-rchan:
-			fmt.Printf("got termination reason\n")
+			slog.Debug("got termination reason\n")
 			request := osp.RemotePlaybackTerminationRequest{
 				Request: osp.Request{
 					RequestId: osp.RequestId(uuid.New().ID()),
@@ -672,7 +785,7 @@ func (c *Client) HandleMedia() error {
 			msg, _ := osp.EncodeMessageWithKey(request, osp.RemotePlaybackTerminationRequestKey)
 
 			osp.SendMessage(c.Conn, msg)
-			fmt.Printf("sent termination request\n")
+			slog.Debug("sent termination request\n")
 
 			select {
 			case <-terminationResponseChan:
@@ -758,9 +871,24 @@ func (c *Client) Listen() error {
 					return errConnectionClosed
 				}
 			} else {
-				fmt.Printf("error accepting stream: %s", err.Error())
+				slog.Error("error accepting stream: %s", "error", err.Error())
 				return err
 			}
+		}
+	}
+}
+
+func ParseDuration(duration time.Duration) string {
+	seconds := int(duration.Seconds()) % 60
+	minutes := int(duration.Minutes()) % 60
+	hours := int(duration.Hours()) % 60
+	if hours > 0 {
+		return fmt.Sprintf("%02d:%02d:%02d", hours, minutes, seconds)
+	} else {
+		if minutes > 0 {
+			return fmt.Sprintf("%02d:%02d", minutes, seconds)
+		} else {
+			return fmt.Sprintf("%02d", seconds)
 		}
 	}
 }

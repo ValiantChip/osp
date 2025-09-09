@@ -2,6 +2,7 @@ package open_screen
 
 import (
 	"errors"
+	"log/slog"
 )
 
 type Handler func([]byte)
@@ -20,6 +21,7 @@ var ErrHandlerNotFound = errors.New("handler not found")
 
 func (m *MessageHandler) HandleMessage(msg []byte) error {
 	key, msg := SeperateVint(msg)
+	slog.Debug("received message", "key", key)
 	if handler, ok := m.handlers[TypeKey(key)]; ok {
 		handler(msg)
 		return nil
