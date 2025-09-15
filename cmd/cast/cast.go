@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
-	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
@@ -24,16 +23,16 @@ import (
 	"sync"
 	"time"
 
-	"filippo.io/edwards25519"
 	osp "github.com/ValiantChip/osp/open_screen"
-	"github.com/ValiantChip/osp/spake2"
 	"github.com/google/uuid"
 
 	"github.com/fxamacker/cbor/v2"
 	"github.com/quic-go/quic-go"
 
+	spake2 "github.com/ValiantChip/gospake2"
 	"github.com/ValiantChip/goutils/pointer"
 	randutil "github.com/ValiantChip/goutils/rand"
+	sliceutil "github.com/ValiantChip/goutils/slices"
 	cmnd "github.com/ValiantChip/uniCommands"
 	"github.com/gabriel-vasile/mimetype"
 )
@@ -44,65 +43,60 @@ var defaultTimeout time.Duration = time.Hour
 
 var terminationTimeout time.Duration = time.Second
 
+var capabilites = []osp.AgentCapability{
+	osp.ControlRemotePlayback,
+}
+
+var requiredCapabilities = []osp.AgentCapability{
+	osp.RecieveRemotePlayback,
+}
+
+var AUTH_CAPABILITIES = osp.AuthCapabilities{
+	PskEaseOfInput:      100,
+	PskInputMethods:     []osp.PskInputMethod{osp.Numeric},
+	PskMinBitsOfEntropy: 32,
+}
+
 type Caster struct {
-	client   *Client
-	clientMu sync.RWMutex
+	runningClient         *Client
+	Transport             *quic.Transport
+	DisplayName           string
+	clientMu              sync.RWMutex
+	AuthenticationChan    chan []byte
+	AuthenticationRequest chan any
+	Locale                string
+}
+
+func NewCaster(clientPort int) *Caster {
+	udp, err := net.ListenUDP("udp", &net.UDPAddr{Port: clientPort})
+	if err != nil {
+		panic(err)
+	}
+
+	transport := &quic.Transport{
+		Conn: udp,
+	}
+
+	return &Caster{
+		AuthenticationChan:    make(chan []byte),
+		AuthenticationRequest: make(chan any),
+		Transport:             transport,
+	}
 }
 
 func (c *Caster) GetClient() *Client {
 	c.clientMu.RLock()
 	defer c.clientMu.RUnlock()
-	return c.client
+	return c.runningClient
 }
 
 func (c *Caster) SetClient(client *Client) {
 	c.clientMu.Lock()
 	defer c.clientMu.Unlock()
-	c.client = client
+	c.runningClient = client
 }
 
-func (c *Caster) Cast(ip net.IP, port int, serverPort int, videoPort int, filename string, at string) error {
-	var fl *os.File
-	var err error
-	if fl, err = os.Open(filename); err != nil {
-		slog.Error("failed to open file: %s", "error", err.Error())
-		return errors.New("failed to open file")
-	}
-	defer fl.Close()
-
-	mimeType, err := mimetype.DetectReader(fl)
-	if err != nil {
-		slog.Error("failed to detect mime type: %s", "error", err.Error())
-		return fmt.Errorf("unable to detect mime type")
-	}
-
-	addr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(ip.String(), strconv.Itoa(port)))
-	if err != nil {
-		panic(err)
-	}
-	udp, err := net.ListenUDP("udp", &net.UDPAddr{Port: serverPort})
-	if err != nil {
-		panic(err)
-	}
-
-	defer udp.Close()
-
-	slog.Info("starting server")
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/video", func(w http.ResponseWriter, r *http.Request) {
-		http.ServeFile(w, r, filename)
-	})
-
-	svr := &http.Server{Addr: fmt.Sprintf(":%d", videoPort), Handler: mux}
-
-	srverr := make(chan error)
-	go func(errchan chan error) {
-		errchan <- svr.ListenAndServe()
-	}(srverr)
-
-	defer svr.Shutdown(context.Background())
-
+func (c *Caster) EstablishConnection(ip net.IP, serverPort int, handleAuthentication bool) (*Client, error) {
 	serialbase, err := rand.Int(rand.Reader, big.NewInt(math.MaxInt32))
 	if err != nil {
 		panic(err)
@@ -145,32 +139,137 @@ func (c *Caster) Cast(ip net.IP, port int, serverPort int, videoPort int, filena
 		PrivateKey:  privatekey,
 	}
 
-	tlsconfig := &tls.Config{
+	tlsconfig := tls.Config{
 		Certificates:       []tls.Certificate{*pair},
 		NextProtos:         []string{"osp"},
 		ServerName:         name,
 		InsecureSkipVerify: true,
 	}
 
-	quicConfig := &quic.Config{
+	quicConfig := quic.Config{
 		MaxIdleTimeout:  2 * time.Minute,
 		KeepAlivePeriod: time.Second * 10,
 	}
 
 	ctx := context.Background()
 
-	conn, err := quic.Dial(ctx, udp, addr, tlsconfig, quicConfig)
+	addr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(ip.String(), strconv.Itoa(serverPort)))
 	if err != nil {
-		slog.Error("quic dial failed", "error", err.Error())
-		return err
+		panic(err)
+	}
+
+	conn, err := c.Transport.Dial(ctx, addr, &tlsconfig, &quicConfig)
+	if err != nil {
+		return nil, err
 	}
 
 	cId := uuid.New()
 
-	client := MakeClient(fp, conn, osp.AuthCapabilities{}, osp.RemotePlaybackId(cId.ID()))
+	client := c.MakeClient(fp, conn, AUTH_CAPABILITIES, osp.RemotePlaybackId(cId.ID()), c.AuthenticationChan, handleAuthentication)
+
+	return client, nil
+}
+
+func (c *Caster) VerifyDevice(ip net.IP, port int, timeout time.Duration) error {
+	client, err := c.EstablishConnection(ip, port, false)
+	if err != nil {
+		slog.Info("unable to establish connection to device", "ip", ip.String())
+		return err
+	}
+
+	errchan := make(chan error)
+	donechan := make(chan error)
+	go func() {
+		errchan <- client.Listen()
+	}()
+
+	go func() {
+		var err error
+		defer func() {
+			select {
+			case donechan <- err:
+			default:
+			}
+		}()
+		requestHandler := osp.NewRequestHandler()
+		er := client.MsgHandler.AddRequestHandler(osp.AgentInfoResponseKey, requestHandler)
+		if er != nil {
+			panic(er)
+		}
+
+		request := osp.AgentInfoRequest{
+			Request: osp.Request{
+				RequestId: osp.RequestId(uuid.New().ID()),
+			},
+		}
+
+		var rsp osp.AgentInfoResponse
+		err = requestHandler.SendRequestWithTimeout(client.Conn, request, &rsp, osp.AgentInfoRequestKey, timeout)
+		if err != nil {
+			if errors.Is(err, osp.ErrRequestTimeout) {
+				slog.Debug("request timed out")
+			}
+			return
+		}
+
+		if !sliceutil.ContainsAll(rsp.AgentInfo.Capabilities, requiredCapabilities) {
+			err = errors.New("missing required capabilities")
+			return
+		}
+	}()
+
+	for {
+		select {
+		case err := <-errchan:
+			if err == errConnectionClosed {
+				return nil
+			}
+			return err
+		case err := <-donechan:
+			return err
+		}
+	}
+}
+
+func (c *Caster) Cast(ip net.IP, serverPort int, videoPort int, filename string, at string) error {
+	var fl *os.File
+	var err error
+	if fl, err = os.Open(filename); err != nil {
+		slog.Error("failed to open file: %s", "error", err.Error())
+		return errors.New("failed to open file")
+	}
+	defer fl.Close()
+
+	mimeType, err := mimetype.DetectReader(fl)
+	if err != nil {
+		slog.Error("failed to detect mime type: %s", "error", err.Error())
+		return fmt.Errorf("unable to detect mime type")
+	}
+
+	client, err := c.EstablishConnection(ip, serverPort, true)
+	if err != nil {
+		slog.Error("failed to establish connection", "error", err.Error())
+		return err
+	}
 
 	c.SetClient(client)
 	defer c.SetClient(nil)
+
+	slog.Info("starting server")
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/video", func(w http.ResponseWriter, r *http.Request) {
+		http.ServeFile(w, r, filename)
+	})
+
+	svr := &http.Server{Addr: fmt.Sprintf(":%d", videoPort), Handler: mux}
+
+	srverr := make(chan error)
+	go func(errchan chan error) {
+		errchan <- svr.ListenAndServe()
+	}(srverr)
+
+	defer svr.Shutdown(context.Background())
 
 	errchan := make(chan error)
 	go func() { errchan <- client.Listen() }()
@@ -178,7 +277,7 @@ func (c *Caster) Cast(ip net.IP, port int, serverPort int, videoPort int, filena
 	protocolChan := make(chan error)
 
 	go func() {
-		protocolChan <- client.HandleProtocol(port, videoPort, mimeType.String())
+		protocolChan <- client.HandleProtocol(serverPort, videoPort, mimeType.String())
 	}()
 
 	select {
@@ -199,12 +298,14 @@ func (c *Caster) Cast(ip net.IP, port int, serverPort int, videoPort int, filena
 }
 
 func (client *Client) HandleProtocol(port int, videoPort int, mimeType string) error {
-	// _, err = client.Authenticate()
-	// if err != nil {
-	// 	client.CloseWithError(errors.New("authentication failed: "+err.Error()), quic.ApplicationErrorCode(quic.ConnectionRefused))
-	// }
+	_, err := client.Authenticate()
+	if err != nil {
+		fmt.Println("Authentication failed")
+		slog.Error(err.Error())
+		client.CloseWithError(errors.New("authentication failed: "+err.Error()), quic.ApplicationErrorCode(quic.ConnectionRefused))
+	}
 
-	// log.Default().Print("Authentication success\n")
+	fmt.Println("Authentication success")
 
 	addrs, err := GetAddresses()
 	if err != nil {
@@ -307,50 +408,69 @@ func GetAddresses() ([]net.IP, error) {
 }
 
 type Client struct {
-	Id                osp.RemotePlaybackId
-	Fingerprint       string
-	Conn              *quic.Conn
-	Capabilities      osp.AuthCapabilities
-	capabilitiesMu    sync.RWMutex
-	agentCapabilities *osp.AuthCapabilities
-	capabilitiesRecv  chan bool
-	infoMu            sync.RWMutex
-	agentInfo         osp.AgentInfo
-	MsgHandler        *osp.MessageHandler
-	ControlsHandler   *cmnd.Handler
-	ControlsChan      chan osp.RemotePlaybackControls
-	stateMu           sync.RWMutex
-	state             osp.RemotePlaybackState
-	playing           bool
-	playingMu         sync.RWMutex
+	Id                    osp.RemotePlaybackId
+	Fingerprint           string
+	Conn                  *quic.Conn
+	packetConn            net.PacketConn
+	Capabilities          osp.AuthCapabilities
+	capabilitiesMu        sync.RWMutex
+	agentCapabilities     *osp.AuthCapabilities
+	capabilitiesRecv      chan bool
+	infoMu                sync.RWMutex
+	agentInfo             osp.AgentInfo
+	ClientInfo            osp.AgentInfo
+	MsgHandler            *osp.MessageHandler
+	ControlsHandler       *cmnd.Handler
+	ControlsChan          chan osp.RemotePlaybackControls
+	authenticationChan    chan []byte
+	authenticationRequest chan any
+	stateMu               sync.RWMutex
+	state                 osp.RemotePlaybackState
+	playing               bool
+	playingMu             sync.RWMutex
 	// ffmpegCmd         *exec.Cmd
 	// ffmpegArgs        []string
 }
 
-func MakeClient(fingerprint string, conn *quic.Conn, capabilities osp.AuthCapabilities, id osp.RemotePlaybackId) *Client {
+func (caster *Caster) MakeClient(fingerprint string, conn *quic.Conn, capabilities osp.AuthCapabilities, id osp.RemotePlaybackId, authChan chan []byte, handleAuthentication bool) *Client {
 	c := new(Client)
 	c.Fingerprint = fingerprint
 	c.Conn = conn
 	c.Id = id
+	token := osp.NewStateToken(osp.STATE_TOKEN_LENGTH)
+	c.ClientInfo = osp.AgentInfo{
+		DisplayName:  caster.DisplayName,
+		Capabilities: capabilites,
+		Locales:      []string{caster.Locale},
+		StateToken:   token,
+	}
 	c.Capabilities = capabilities
+	c.authenticationChan = authChan
+	c.authenticationRequest = caster.AuthenticationRequest
 	c.agentCapabilities = nil
 	c.capabilitiesRecv = make(chan bool)
 	c.ControlsChan = make(chan osp.RemotePlaybackControls, 1)
 	c.MsgHandler = osp.NewMessageHandler()
-	c.MsgHandler.AddHandler(osp.AuthCapabilitiesKey, func(msg []byte) {
-		c.HandleAuthCapabilities(msg)
+	if handleAuthentication {
+		c.MsgHandler.AddHandler(osp.AuthCapabilitiesKey, func(msg []byte) {
+			c.HandleAuthCapabilities(msg)
+		})
+	}
+
+	c.MsgHandler.AddHandler(osp.AgentInfoRequestKey, func(msg []byte) {
+		c.HandleInfoRequest(msg)
 	})
 
-	c.ControlsHandler = cmnd.NewHandler(cmnd.HandlerArg{
-		Name:        "toggle_pause",
-		Description: "toggles if the player is paused",
-		Runner: func(args []string) error {
-			state := c.GetState()
-			c.ControlsChan <- osp.RemotePlaybackControls{Paused: pointer.New(!pointer.ValIfNil(state.Paused, false))}
-			return nil
+	c.ControlsHandler = cmnd.NewHandler(
+		cmnd.HandlerArg{
+			Name:        "toggle_pause",
+			Description: "toggles if the player is paused",
+			Runner: func(args []string) error {
+				state := c.GetState()
+				c.ControlsChan <- osp.RemotePlaybackControls{Paused: pointer.New(!pointer.ValIfNil(state.Paused, false))}
+				return nil
+			},
 		},
-	},
-
 		cmnd.HandlerArg{
 			Name:        "toggle_mute",
 			Description: "toggles if the player is muted",
@@ -438,7 +558,6 @@ func MakeClient(fingerprint string, conn *quic.Conn, capabilities osp.AuthCapabi
 				return nil
 			},
 		},
-
 		cmnd.HandlerArg{
 			Name:        "help",
 			Description: "print this message",
@@ -450,6 +569,22 @@ func MakeClient(fingerprint string, conn *quic.Conn, capabilities osp.AuthCapabi
 		},
 	)
 	return c
+}
+
+func (c *Client) HandleInfoRequest(msg []byte) {
+	var req osp.AgentInfoRequest
+	err := cbor.Unmarshal(msg, &req)
+	if err != nil {
+		return
+	}
+
+	rsp := osp.AgentInfoResponse{
+		Response:  osp.Response{ResponseId: osp.ResponseId(req.RequestId)},
+		AgentInfo: c.ClientInfo,
+	}
+
+	msg, _ = osp.EncodeMessageWithKey(rsp, osp.AgentInfoResponseKey)
+	osp.SendMessage(c.Conn, msg)
 }
 
 func (c *Client) IsPlaying() bool {
@@ -525,13 +660,13 @@ func (c *Client) HandleAuthCapabilities(buff []byte) {
 	c.capabilitiesRecv <- true
 }
 
-var dictionary = []byte("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ?!")
+var dictionary = []byte(randutil.ALPHA_NUMERIC + "?!")
 
-func ReadPassword() ([]byte, error) {
-	pw := make([]byte, 1000)
-	fmt.Print("Input password: ")
-	_, err := fmt.Scanln(&pw)
-	return pw, err
+func ReadPassword(authChan chan []byte, authRequest chan any) ([]byte, error) {
+	slog.Info("requesting password")
+	authRequest <- struct{}{}
+	pw := <-authChan
+	return pw, nil
 }
 
 func PrintPassword(pw []byte) {
@@ -539,6 +674,8 @@ func PrintPassword(pw []byte) {
 }
 
 func (c *Client) Authenticate() ([]byte, error) {
+	handshakechan, _ := c.MsgHandler.ListenForKey(osp.AuthSpake2HandshakeKey)
+	confChan, _ := c.MsgHandler.ListenForKey(osp.AuthSpake2ConfirmationKey)
 	msg, err := osp.EncodeMessageWithKey(c.Capabilities, osp.AuthCapabilitiesKey)
 	if err != nil {
 		c.CloseWithError(errors.New("failed to get auth capabilities"), quic.ApplicationErrorCode(quic.ConnectionRefused))
@@ -564,37 +701,45 @@ func (c *Client) Authenticate() ([]byte, error) {
 	var status osp.AuthSpake2PskStatus
 	cap := c.GetAgentCapabilities()
 	entropy := max(c.Capabilities.PskMinBitsOfEntropy, cap.PskMinBitsOfEntropy)
+
+	A := c.Fingerprint
+	B := c.Conn.ConnectionState().TLS.PeerCertificates[0].Subject.CommonName[:43]
+	var s spake2.Spake2Handler
 	if c.Capabilities.PskEaseOfInput >= cap.PskEaseOfInput {
 		var err error
-		pw, err = ReadPassword()
+		pw, err = ReadPassword(c.authenticationChan, c.authenticationRequest)
 		if err != nil {
 			return pw, fmt.Errorf("failed to read password: %s", err.Error())
 		}
 		status = osp.PskInput
+
+		s, err = spake2.NewA(pw, A, B, rand.Reader, spake2.DEFAULT_SUITE)
+		if err != nil {
+			return nil, fmt.Errorf("failed to init spake2: %s", err.Error())
+		}
 	} else {
 		var err error
-		pw, err = randutil.Bytes(rand.Reader, dictionary, int64(math.Ceil(float64(entropy)*(float64(6)/float64(8)))))
+		pw, err = randutil.Bytes(rand.Reader, dictionary, int64(math.Ceil(float64(entropy)/(osp.CalculateBitsOfEntropy(dictionary)))))
 		if err != nil {
 			panic(err)
 		}
 		PrintPassword(pw)
 		status = osp.PskShown
-	}
-	A := c.Fingerprint
-	B := c.Conn.ConnectionState().TLS.PeerCertificates[0].Subject.CommonName[:43]
 
-	w, err := spake2.Generate_w(pw)
+		s, err = spake2.NewB(pw, A, B, rand.Reader, spake2.DEFAULT_SUITE)
+		if err != nil {
+			return nil, fmt.Errorf("failed to init spake2: %s", err.Error())
+		}
+	}
+
+	msg, err = s.Start()
 	if err != nil {
-		panic(err)
+		return nil, fmt.Errorf("failed to start spake2: %s", err.Error())
 	}
-
-	x := spake2.RandomScalar()
-
-	pA := spake2.Generate_pA(w, x)
 
 	handshake := osp.AuthSpake2Handshake{
 		PskStatus:   status,
-		PublicValue: pA.Bytes(),
+		PublicValue: msg,
 	}
 	msg, err = osp.EncodeMessageWithKey(handshake, osp.AuthSpake2HandshakeKey)
 	if err != nil {
@@ -606,32 +751,25 @@ func (c *Client) Authenticate() ([]byte, error) {
 		return []byte{}, err
 	}
 
-	rspchan, err := c.MsgHandler.ListenForKey(osp.AuthSpake2HandshakeKey)
-	if err != nil {
-		return []byte{}, err
-	}
-	rsp := <-rspchan
-	response := osp.AuthSpake2Handshake{}
+	slog.Info("sent spake2 handshake")
+
+	rsp := <-handshakechan
+
+	slog.Info("received spake2 handshake")
+
+	var response osp.AuthSpake2Handshake
 	err = cbor.Unmarshal(rsp, &response)
 	if err != nil {
 		return []byte{}, err
 	}
-	if response.PskStatus != osp.PskShown {
+	if response.PskStatus == status {
 		return []byte{}, errors.New("wrong psk status")
 	}
 
-	pB := &edwards25519.Point{}
-	pB, err = pB.SetBytes(response.PublicValue)
-	if err != nil {
-		return []byte{}, err
-	}
-
-	K := spake2.AGenerateK(pA, pB, w, x)
-
-	Ke, cA, cB := spake2.GenerateSecrets(A, B, pA, pB, K, w)
+	key, confm, err := s.Finish(response.PublicValue)
 
 	conf := osp.AuthSpake2Confirmation{
-		Bytes: cA,
+		Bytes: confm,
 	}
 
 	msg, err = osp.EncodeMessageWithKey(conf, osp.AuthSpake2ConfirmationKey)
@@ -639,26 +777,25 @@ func (c *Client) Authenticate() ([]byte, error) {
 		return []byte{}, err
 	}
 	err = osp.SendMessage(c.Conn, msg)
+	slog.Info("sent spake2 confirmation")
 	if err != nil {
 		return []byte{}, err
 	}
+	rsp = <-confChan
 
-	rspchan, err = c.MsgHandler.ListenForKey(osp.AuthSpake2ConfirmationKey)
-	if err != nil {
-		return []byte{}, err
-	}
-	rsp = <-rspchan
+	slog.Info("received spake2 confirmation")
 	var confrsp osp.AuthSpake2Confirmation
 	err = cbor.Unmarshal(rsp, &confrsp)
 	if err != nil {
 		return []byte{}, err
 	}
 
-	if !hmac.Equal(confrsp.Bytes, cB) {
-		return []byte{}, errors.New("spake2 confirmation failed")
+	err = s.Verify(confrsp.Bytes)
+	if err != nil {
+		return []byte{}, fmt.Errorf("verification failed")
 	}
 
-	return Ke, nil
+	return key, nil
 }
 
 func (c *Client) HandleControl(cmd []string) error {

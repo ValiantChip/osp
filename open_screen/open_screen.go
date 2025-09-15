@@ -2,12 +2,29 @@ package open_screen
 
 import (
 	"errors"
+	"math"
 	"math/big"
 
+	"crypto/rand"
+
+	randutil "github.com/ValiantChip/goutils/rand"
 	vint "github.com/ValiantChip/osp/variable_int"
 	"github.com/fxamacker/cbor/v2"
 	"github.com/quic-go/quic-go"
 )
+
+const STATE_TOKEN_LENGTH = 8
+
+const STATE_TOKEN_DICTIONARY = randutil.ALPHA_NUMERIC
+
+func NewStateToken(length int) string {
+	token, _ := randutil.Bytes(rand.Reader, []byte(STATE_TOKEN_DICTIONARY), int64(length))
+	return string(token)
+}
+
+func CalculateBitsOfEntropy(dictionary []byte) float64 {
+	return math.Log2(float64(len(dictionary)))
+}
 
 func SeperateVint(buff []byte) (uint64, []byte) {
 	b := buff[0]
@@ -295,7 +312,7 @@ type OspResponse interface {
 
 const AgentInfoRequestKey TypeKey = 10
 
-type AgentInforRequest struct {
+type AgentInfoRequest struct {
 	Request
 }
 

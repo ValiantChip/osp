@@ -22,7 +22,7 @@ var N, _ = new(edwards25519.Point).SetBytes(npnt)
 var P = edwards25519.NewGeneratorPoint()
 
 func Generate_w(pw []byte) (w *edwards25519.Scalar, err error) {
-	q := sha512.Sum512(pw)
+	q := sha512.New().Sum(pw)
 	w, err = edwards25519.NewScalar().SetUniformBytes(q[:])
 	return
 }

@@ -1,6 +1,7 @@
 package mdns
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"net"
@@ -53,9 +54,31 @@ func FindTxtKey(key string, record []string) (string, bool) {
 }
 
 func (c *Client) FindDevices() {
-	resultChan := make(chan *mdns.ServiceEntry, 5)
+	resultChan := make(chan *mdns.ServiceEntry)
 	go c.addDevices(resultChan)
-	c.deviceDiscovery(resultChan)
+	c.deviceDiscovery(context.Background(), resultChan)
+}
+
+func (c *Client) FindDevice(name string) *Device {
+	resultChan := make(chan *mdns.ServiceEntry)
+	ctx, cancel := context.WithCancel(context.Background())
+	var result *mdns.ServiceEntry
+	go func() {
+		for r := range resultChan {
+			if name == r.Name || name == strings.Split(r.Name, ".")[0] {
+				result = r
+				cancel()
+				return
+			}
+		}
+	}()
+	c.deviceDiscovery(ctx, resultChan)
+	if result == nil {
+		return nil
+	}
+
+	d := c.ServiceEntryToDevice(result)
+	return &d
 }
 
 func (c *Client) addDevices(resultChan chan *mdns.ServiceEntry) {
@@ -75,7 +98,7 @@ func (c *Client) GetAddress(hostName string) net.IP {
 	return nil
 }
 
-func (c *Client) deviceDiscovery(resultChan chan *mdns.ServiceEntry) {
+func (c *Client) deviceDiscovery(ctx context.Context, resultChan chan *mdns.ServiceEntry) {
 	param := mdns.QueryParam{
 		Service:     Service,
 		DisableIPv6: !c.config.UseIpv6,
@@ -83,7 +106,7 @@ func (c *Client) deviceDiscovery(resultChan chan *mdns.ServiceEntry) {
 		Timeout:     10 * time.Second,
 	}
 
-	err := mdns.Query(&param)
+	err := mdns.QueryContext(ctx, &param)
 	if err != nil {
 		c.logger.Error(fmt.Sprintf("Querry error %s", err))
 	}
@@ -93,24 +116,28 @@ func (c *Client) addDevice(s *mdns.ServiceEntry) {
 	i := c.findDevice(s)
 	if i == -1 {
 		c.logger.Info(fmt.Sprintf("Service %s with name %s not found yet, adding", c.getAddress(s).String(), s.Name))
-		names := []string{s.Name}
-		address := c.getAddress(s)
-		at, exists := FindTxtKey("at", s.InfoFields)
-		if !exists {
-			at = ""
-		}
-
-		d := Device{
-			Names:     names,
-			Address:   address,
-			Port:      s.Port,
-			AuthToken: at,
-		}
+		d := c.ServiceEntryToDevice(s)
 		c.devices = append(c.devices, d)
 	} else {
 		c.logger.Info(fmt.Sprintf("Service %s already found, adding additional name %s", c.getAddress(s).String(), s.Name))
 
 		c.devices[i].Names = append(c.devices[i].Names, s.Name)
+	}
+}
+
+func (c *Client) ServiceEntryToDevice(s *mdns.ServiceEntry) Device {
+	names := []string{s.Name}
+	address := c.getAddress(s)
+	at, exists := FindTxtKey("at", s.InfoFields)
+	if !exists {
+		at = ""
+	}
+
+	return Device{
+		Names:     names,
+		Address:   address,
+		Port:      s.Port,
+		AuthToken: at,
 	}
 }
 

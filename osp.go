@@ -9,12 +9,18 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/ValiantChip/osp/cmd/cast"
 	"github.com/ValiantChip/osp/mdns"
 	"github.com/ValiantChip/osp/open_screen"
 	cmnd "github.com/ValiantChip/uniCommands"
 )
+
+var clientPort = 7938
+var videoPort = 9567
+var verifyTimeout = 2 * time.Second
 
 func main() {
 	os.Exit(ReturnWithExitCode())
@@ -25,7 +31,7 @@ func GetLevel(l int) slog.Level {
 }
 
 type Client struct {
-	caster         cast.Caster
+	caster         *cast.Caster
 	doneChan       chan error
 	exitChan       chan struct{}
 	commandHandler *cmnd.Handler
@@ -33,7 +39,7 @@ type Client struct {
 
 func NewClient() *Client {
 	c := new(Client)
-	c.caster = cast.Caster{}
+	c.caster = cast.NewCaster(clientPort)
 	c.doneChan = make(chan error, 1)
 	c.exitChan = make(chan struct{}, 1)
 	c.commandHandler = cmnd.NewHandler(cmnd.HandlerArg{
@@ -46,52 +52,31 @@ func NewClient() *Client {
 			}
 			if len(args) < 3 {
 				fmt.Println("not enough arguments to call cast need: cast <hostname> <filename>")
+				return nil
 			}
 
 			hostName := args[1]
 			filename := args[2]
-			client := mdns.NewClient(slog.Default())
-			client.FindDevices()
 			var ip net.IP
 			var port int
 			var at string
 
-			success := false
-
 			if addr, err := net.ResolveUDPAddr("udp", hostName); err == nil {
 				ip = addr.IP
 				port = addr.Port
-
-				for _, d := range client.Devices() {
-					if d.Address.Equal(ip) {
-						success = true
-						at = d.AuthToken
-						break
-					}
-				}
 			} else {
-				for _, d := range client.Devices() {
-					for _, n := range d.Names {
-						split := strings.Split(n, `.`)
-						name := split[0]
-						if hostName == n || hostName == name {
-							ip = d.Address
-							port = d.Port
-							success = true
-							at = d.AuthToken
-							break
-						}
-					}
+				client := mdns.NewClient(slog.Default())
+				d := client.FindDevice(hostName)
+				if d == nil {
+					fmt.Println("casting failed - device not found")
+					return nil
 				}
-
+				ip = d.Address
+				port = d.Port
+				at = d.AuthToken
 			}
 
-			if !success {
-				fmt.Println("casting failed - device not found")
-				return nil
-			}
-
-			go func() { c.doneChan <- c.caster.Cast(ip, port, 7938, 9567, filename, at) }()
+			go func() { c.doneChan <- c.caster.Cast(ip, port, videoPort, filename, at) }()
 
 			return nil
 		},
@@ -103,12 +88,33 @@ func NewClient() *Client {
 			client := mdns.NewClient(slog.Default())
 			client.FindDevices()
 			devices := client.Devices()
-			if len(devices) == 0 {
+			validDevices := make([]mdns.Device, 0)
+			devicesChan := make(chan mdns.Device)
+			var wg sync.WaitGroup
+			for _, d := range devices {
+				wg.Add(1)
+				go func() {
+					err := c.caster.VerifyDevice(d.Address, d.Port, verifyTimeout)
+					if err == nil {
+						devicesChan <- d
+					}
+					wg.Done()
+				}()
+			}
+			go func() {
+				for d := range devicesChan {
+					validDevices = append(validDevices, d)
+				}
+			}()
+
+			wg.Wait()
+			close(devicesChan)
+			if len(validDevices) == 0 {
 				fmt.Println("no devices found")
 				return nil
 			}
 			fmt.Println("devices found:")
-			for _, d := range devices {
+			for _, d := range validDevices {
 				fmt.Print("	")
 				split := strings.Split(d.Names[0], `.`)
 				name := split[0]
@@ -146,7 +152,8 @@ func NewClient() *Client {
 
 				return nil
 			},
-		}, cmnd.HandlerArg{
+		},
+		cmnd.HandlerArg{
 			Name:        "quit",
 			Description: "exit the program",
 			Runner: func(args []string) error {
@@ -192,6 +199,7 @@ func ReturnWithExitCode() int {
 	fmt.Print("type help for a list of available commands\n")
 
 	client := NewClient()
+	defer client.caster.Transport.Close()
 	inputChan := make(chan string)
 	go func() {
 		buff := make([]byte, 1000)
@@ -210,6 +218,13 @@ func ReturnWithExitCode() int {
 	}()
 	for {
 		select {
+		case <-client.caster.AuthenticationRequest:
+			fmt.Println("Input password:")
+			fmt.Print("    ")
+			go client.commandHandler.ForceResponse(func(args []string) error {
+				client.caster.AuthenticationChan <- []byte(args[0])
+				return nil
+			})
 		case input := <-inputChan:
 			args := strings.Split(input, " ")
 			client.HandleCommand(args)
@@ -218,6 +233,8 @@ func ReturnWithExitCode() int {
 			if err != nil {
 				slog.Error("error while casting", "error", err)
 			}
+		case <-client.exitChan:
+			return 0
 		}
 	}
 }
