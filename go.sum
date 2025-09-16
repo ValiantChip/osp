@@ -4,10 +4,10 @@ github.com/ValiantChip/gospake2 v0.1.2 h1:xxqqdwKxpIGsjRhES9EYBAIIL2GooC41zGKYsg
 github.com/ValiantChip/gospake2 v0.1.2/go.mod h1:OdB/ml7OtL1jujFHGGfNV82H5nUZa8IQxZ45jWTk67Q=
 github.com/ValiantChip/goutils v0.1.3 h1:Na58+MDXG5Pwk3GqtzV1YVhTC8+XRbycQIjOmfw92Hg=
 github.com/ValiantChip/goutils v0.1.3/go.mod h1:WuIQM4TnoOhAN+KYEa+vILGkCXgVOwnruW6IxkNXtjU=
+github.com/ValiantChip/libvlc-go v0.1.0 h1:BVDIV4oCBbVmkOjAs3sum0jo5O2oPsRywVVIYfCDxrY=
+github.com/ValiantChip/libvlc-go v0.1.0/go.mod h1:YD9FSno835YEtSoFkD63J3K5f4LxYjEojUSSHe1ax14=
 github.com/ValiantChip/uniCommands v0.1.1 h1:mx6v4MfcG7xl+vKBdy3B2MxgthYtcEeBp0qxGmiVfCg=
 github.com/ValiantChip/uniCommands v0.1.1/go.mod h1:Fcqt4c3EV0+FmRwTkQOieQIaIU2ckUo6eysqO47acqY=
-github.com/adrg/libvlc-go/v3 v3.1.6 h1:Cm22w6xNMDdzYCW8koHgAvjonYm4xbPP5TrlVTtMdl4=
-github.com/adrg/libvlc-go/v3 v3.1.6/go.mod h1:xJK0YD8cyMDejnrTFQinStE6RYCV1nlfS8KmqTpszSc=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/fxamacker/cbor/v2 v2.9.0 h1:NpKPmjDBgUfBms6tr6JZkTHtfFGcMKsw3eGcmD/sapM=

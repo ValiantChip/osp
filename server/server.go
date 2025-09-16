@@ -25,7 +25,7 @@ import (
 	"sync"
 	"time"
 
-	vlc "github.com/adrg/libvlc-go/v3"
+	vlc "github.com/ValiantChip/libvlc-go"
 	"github.com/fxamacker/cbor/v2"
 	"github.com/hashicorp/mdns"
 	"github.com/quic-go/quic-go"
@@ -341,6 +341,7 @@ func (s *Server) NewAgent(conn *quic.Conn) *Agent {
 }
 
 func (a *Agent) HandleInfoRequest(msg []byte) {
+	a.Server.Logger.Info("received info request")
 	var req osp.AgentInfoRequest
 	err := cbor.Unmarshal(msg, &req)
 	if err != nil {

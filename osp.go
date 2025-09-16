@@ -39,7 +39,7 @@ type Client struct {
 
 func NewClient() *Client {
 	c := new(Client)
-	c.caster = cast.NewCaster(clientPort)
+	c.caster = cast.NewCaster(clientPort, slog.Default())
 	c.doneChan = make(chan error, 1)
 	c.exitChan = make(chan struct{}, 1)
 	c.commandHandler = cmnd.NewHandler(cmnd.HandlerArg{
@@ -91,24 +91,33 @@ func NewClient() *Client {
 			validDevices := make([]mdns.Device, 0)
 			devicesChan := make(chan mdns.Device)
 			var wg sync.WaitGroup
-			for _, d := range devices {
-				wg.Add(1)
-				go func() {
-					err := c.caster.VerifyDevice(d.Address, d.Port, verifyTimeout)
-					if err == nil {
-						devicesChan <- d
-					}
-					wg.Done()
-				}()
-			}
+			wg.Add(1)
+			go func() {
+				var dg sync.WaitGroup
+				for _, d := range devices {
+					dg.Add(1)
+					go func() {
+						err := c.caster.VerifyDevice(d.Address, d.Port, verifyTimeout)
+						if err == nil {
+							devicesChan <- d
+						}
+						dg.Done()
+					}()
+				}
+				dg.Wait()
+				close(devicesChan)
+				wg.Done()
+			}()
+			wg.Add(1)
 			go func() {
 				for d := range devicesChan {
+					slog.Debug("device found", "ip", d.Address.String(), "port", d.Port)
 					validDevices = append(validDevices, d)
 				}
+				wg.Done()
 			}()
 
 			wg.Wait()
-			close(devicesChan)
 			if len(validDevices) == 0 {
 				fmt.Println("no devices found")
 				return nil

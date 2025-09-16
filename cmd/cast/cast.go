@@ -59,6 +59,7 @@ var AUTH_CAPABILITIES = osp.AuthCapabilities{
 
 type Caster struct {
 	runningClient         *Client
+	logger                *slog.Logger
 	Transport             *quic.Transport
 	DisplayName           string
 	clientMu              sync.RWMutex
@@ -67,7 +68,8 @@ type Caster struct {
 	Locale                string
 }
 
-func NewCaster(clientPort int) *Caster {
+func NewCaster(clientPort int, logger *slog.Logger) *Caster {
+	slog.SetDefault(logger)
 	udp, err := net.ListenUDP("udp", &net.UDPAddr{Port: clientPort})
 	if err != nil {
 		panic(err)
@@ -177,8 +179,8 @@ func (c *Caster) VerifyDevice(ip net.IP, port int, timeout time.Duration) error 
 		return err
 	}
 
-	errchan := make(chan error)
-	donechan := make(chan error)
+	errchan := make(chan error, 1)
+	donechan := make(chan error, 1)
 	go func() {
 		errchan <- client.Listen()
 	}()
@@ -203,16 +205,22 @@ func (c *Caster) VerifyDevice(ip net.IP, port int, timeout time.Duration) error 
 			},
 		}
 
+		slog.Debug("sending agent info request")
 		var rsp osp.AgentInfoResponse
 		err = requestHandler.SendRequestWithTimeout(client.Conn, request, &rsp, osp.AgentInfoRequestKey, timeout)
 		if err != nil {
 			if errors.Is(err, osp.ErrRequestTimeout) {
 				slog.Debug("request timed out")
+			} else {
+				slog.Debug("error sending agent info request", "error", err.Error())
 			}
 			return
+		} else {
+			slog.Debug("received agent info response")
 		}
 
 		if !sliceutil.ContainsAll(rsp.AgentInfo.Capabilities, requiredCapabilities) {
+			slog.Debug("missing required capabilities")
 			err = errors.New("missing required capabilities")
 			return
 		}
@@ -221,12 +229,16 @@ func (c *Caster) VerifyDevice(ip net.IP, port int, timeout time.Duration) error 
 	for {
 		select {
 		case err := <-errchan:
+			slog.Debug("connection closed", "error", err)
 			if err == errConnectionClosed {
 				return nil
 			}
 			return err
 		case err := <-donechan:
-			return err
+			if err != nil {
+				return err
+			}
+			return nil
 		}
 	}
 }
