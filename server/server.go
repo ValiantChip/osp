@@ -630,8 +630,6 @@ func (a *Agent) HandleMedia(initcontrols osp.RemotePlaybackControls, initState o
 
 	a.Server.RequestSource(*initState.Source, play)
 
-	a.Server.Logger.Info("here")
-
 	defer a.Server.Player.Stop()
 
 	playerState := a.PlayerState()
@@ -792,9 +790,7 @@ func (a *Agent) HandleControls(controls osp.RemotePlaybackControls, currentState
 	player := a.Server.Player
 
 	if controls.Paused != nil {
-		logger.Info("pausing")
 		if player.CanPause() {
-			logger.Info(fmt.Sprintf("paused: %t", *controls.Paused))
 			err := player.SetPause(*controls.Paused)
 			if err != nil {
 				logger.Error(fmt.Sprintf("error pausing: %s", err.Error()))
@@ -802,7 +798,6 @@ func (a *Agent) HandleControls(controls osp.RemotePlaybackControls, currentState
 				return
 			} else {
 				state.Paused = controls.Paused
-				logger.Info("pause success")
 			}
 		} else {
 			logger.Info("player can't pause")
