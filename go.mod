@@ -12,8 +12,8 @@ require (
 )
 
 require (
-	github.com/ValiantChip/gospake2 v0.1.2
-	github.com/ValiantChip/libvlc-go v0.1.0
+	github.com/ValiantChip/gospake2 v0.1.5
+	github.com/ValiantChip/libvlc-go v0.1.1
 	github.com/ValiantChip/uniCommands v0.1.1
 	github.com/gabriel-vasile/mimetype v1.4.10
 	github.com/google/uuid v1.6.0
