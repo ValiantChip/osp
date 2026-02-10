@@ -55,8 +55,13 @@ var AUTH_CAPABILITIES = osp.AuthCapabilities{
 	PskMinBitsOfEntropy: 32,
 }
 
+type ClientInteraction interface {
+	TermEnd()
+	ControlsHandler() *cmnd.Handler
+}
+
 type Caster struct {
-	runningClient         *Client
+	runningClient         ClientInteraction
 	logger                *slog.Logger
 	Transport             *quic.Transport
 	DisplayName           string
@@ -84,13 +89,13 @@ func NewCaster(clientPort int, logger *slog.Logger) *Caster {
 	}
 }
 
-func (c *Caster) GetClient() *Client {
+func (c *Caster) GetClient() ClientInteraction {
 	c.clientMu.RLock()
 	defer c.clientMu.RUnlock()
 	return c.runningClient
 }
 
-func (c *Caster) SetClient(client *Client) {
+func (c *Caster) SetClient(client ClientInteraction) {
 	c.clientMu.Lock()
 	defer c.clientMu.Unlock()
 	c.runningClient = client
@@ -163,9 +168,7 @@ func (c *Caster) EstablishConnection(ip net.IP, serverPort int, handleAuthentica
 		return nil, err
 	}
 
-	cId := uuid.New()
-
-	client := c.MakeClient(fp, conn, AUTH_CAPABILITIES, osp.RemotePlaybackId(cId.ID()), c.AuthenticationChan, handleAuthentication)
+	client := c.MakeClient(fp, conn, AUTH_CAPABILITIES, c.AuthenticationChan, handleAuthentication)
 
 	return client, nil
 }
@@ -252,6 +255,7 @@ func (c *Caster) Stream(ip net.IP, serverPort int, filename string) error {
 	defer fl.Close()
 
 	return nil
+
 }
 
 func (c *Caster) Cast(ip net.IP, serverPort int, videoPort int, filename string, at string) error {
@@ -275,9 +279,6 @@ func (c *Caster) Cast(ip net.IP, serverPort int, videoPort int, filename string,
 		return err
 	}
 
-	c.SetClient(client)
-	defer c.SetClient(nil)
-
 	slog.Info("starting server")
 
 	mux := http.NewServeMux()
@@ -299,33 +300,39 @@ func (c *Caster) Cast(ip net.IP, serverPort int, videoPort int, filename string,
 
 	protocolChan := make(chan error)
 
+	id := uuid.New()
+	play := c.MakePlayback(client, osp.RemotePlaybackId(id.ID()))
+
+	c.SetClient(play)
+	defer c.SetClient(nil)
+
 	go func() {
-		protocolChan <- client.HandleProtocol(serverPort, videoPort, mimeType.String())
+		protocolChan <- play.HandleRemotePlayback(serverPort, videoPort, mimeType.String())
 	}()
 
 	select {
 	case <-srverr:
 		slog.Info("server shutdown")
-		client.Terminate(osp.UnknownTerminationReason)
+		play.Terminate(osp.UnknownTerminationReason)
 	case err := <-errchan:
 		slog.Error("client listening shutdown", "error", err)
-		client.Terminate(osp.UnknownTerminationReason)
+		play.Terminate(osp.UnknownTerminationReason)
 	case err := <-protocolChan:
 		if err != nil {
 			slog.Error("Protocol error", "error", err)
 		}
 		slog.Info("protocol shutdown")
-		client.Terminate(osp.UnknownTerminationReason)
+		play.Terminate(osp.UnknownTerminationReason)
 	}
 	return nil
 }
 
-func (client *Client) HandleProtocol(port int, videoPort int, mimeType string) error {
-	_, err := client.Authenticate()
+func (play *Playback) HandleRemotePlayback(port int, videoPort int, mimeType string) error {
+	_, err := play.client.Authenticate()
 	if err != nil {
 		fmt.Println("Authentication failed")
 		slog.Error(err.Error())
-		client.CloseWithError(errors.New("authentication failed: "+err.Error()), quic.ApplicationErrorCode(quic.ConnectionRefused))
+		play.client.CloseWithError(errors.New("authentication failed: "+err.Error()), quic.ApplicationErrorCode(quic.ConnectionRefused))
 	}
 
 	fmt.Println("Authentication success")
@@ -345,19 +352,19 @@ func (client *Client) HandleProtocol(port int, videoPort int, mimeType string) e
 	}
 
 	startRequestHandler := osp.NewRequestHandler()
-	client.MsgHandler.AddRequestHandler(osp.RemotePlaybackStartResponseKey, startRequestHandler)
+	play.client.MsgHandler.AddRequestHandler(osp.RemotePlaybackStartResponseKey, startRequestHandler)
 
 	slog.Debug("sending start request")
 	request := osp.RemotePlaybackStartRequest{
 		Request: osp.Request{
 			RequestId: osp.RequestId(uuid.New().ID()),
 		},
-		RemotePlaybackId: client.Id,
+		RemotePlaybackId: play.Id,
 		Sources:          &sources,
 	}
 
 	slog.Debug("sent start request")
-	data, err := startRequestHandler.SendRequestWithTimeout(client.Conn, request, osp.RemotePlaybackStartRequestKey, defaultTimeout)
+	data, err := startRequestHandler.SendRequestWithTimeout(play.client.Conn, request, osp.RemotePlaybackStartRequestKey, defaultTimeout)
 	if err != nil {
 		slog.Error("error sending start request")
 		return err
@@ -371,24 +378,32 @@ func (client *Client) HandleProtocol(port int, videoPort int, mimeType string) e
 		return errors.New("request refused")
 	}
 
-	client.SetState(*response.State)
+	play.SetState(*response.State)
 
-	client.SetPlaying(true)
-	defer client.SetPlaying(false)
+	play.SetPlaying(true)
+	defer play.SetPlaying(false)
 
-	return client.HandleMedia()
+	return play.HandleMedia()
 }
 
-func (c *Client) Terminate(reason osp.RemotePlaybackTerminationRequestReason) {
+func (play *Playback) Terminate(reason osp.RemotePlaybackTerminationRequestReason) {
 	term := &osp.RemotePlaybackTerminationRequest{
 		Request: osp.Request{
 			RequestId: osp.RequestId(uuid.New().ID()),
 		},
-		RemotePlaybackId: c.Id,
+		RemotePlaybackId: play.Id,
 		Reason:           reason,
 	}
 	msg, _ := osp.EncodeMessageWithKey(term, osp.RemotePlaybackTerminationRequestKey)
-	osp.SendMessage(c.Conn, msg)
+	osp.SendMessage(play.client.Conn, msg)
+}
+
+func (play *Playback) TermEnd() {
+	play.Terminate(osp.UserTerminatedViaController)
+}
+
+func (play *Playback) ControlsHandler() *cmnd.Handler {
+	return play.client.ControlsHandler
 }
 
 type KeyTypeNotRecognizedError struct {
@@ -432,7 +447,6 @@ func GetAddresses() ([]net.IP, error) {
 }
 
 type Client struct {
-	Id                    osp.RemotePlaybackId
 	Fingerprint           string
 	Conn                  *quic.Conn
 	packetConn            net.PacketConn
@@ -444,23 +458,30 @@ type Client struct {
 	agentInfo             osp.AgentInfo
 	ClientInfo            osp.AgentInfo
 	MsgHandler            *osp.MessageHandler
-	ControlsHandler       *cmnd.Handler
-	ControlsChan          chan osp.RemotePlaybackControls
 	authenticationChan    chan []byte
 	authenticationRequest chan any
-	stateMu               sync.RWMutex
-	state                 osp.RemotePlaybackState
-	playing               bool
-	playingMu             sync.RWMutex
+	ControlsHandler       *cmnd.Handler
 	// ffmpegCmd         *exec.Cmd
 	// ffmpegArgs        []string
 }
 
-func (caster *Caster) MakeClient(fingerprint string, conn *quic.Conn, capabilities osp.AuthCapabilities, id osp.RemotePlaybackId, authChan chan []byte, handleAuthentication bool) *Client {
+type Playback struct {
+	client       *Client
+	Id           osp.RemotePlaybackId
+	ControlsChan chan osp.RemotePlaybackControls
+	stateMu      sync.RWMutex
+	state        osp.RemotePlaybackState
+	playing      bool
+	playingMu    sync.RWMutex
+}
+
+type Streamer struct {
+}
+
+func (caster *Caster) MakeClient(fingerprint string, conn *quic.Conn, capabilities osp.AuthCapabilities, authChan chan []byte, handleAuthentication bool) *Client {
 	c := new(Client)
 	c.Fingerprint = fingerprint
 	c.Conn = conn
-	c.Id = id
 	token := osp.NewStateToken(osp.STATE_TOKEN_LENGTH)
 	c.ClientInfo = osp.AgentInfo{
 		DisplayName:  caster.DisplayName,
@@ -473,7 +494,6 @@ func (caster *Caster) MakeClient(fingerprint string, conn *quic.Conn, capabiliti
 	c.authenticationRequest = caster.AuthenticationRequest
 	c.agentCapabilities = nil
 	c.capabilitiesRecv = make(chan bool)
-	c.ControlsChan = make(chan osp.RemotePlaybackControls, 1)
 	c.MsgHandler = osp.NewMessageHandler()
 	if handleAuthentication {
 		c.MsgHandler.AddHandler(osp.AuthCapabilitiesKey, func(data any) {
@@ -487,7 +507,15 @@ func (caster *Caster) MakeClient(fingerprint string, conn *quic.Conn, capabiliti
 		c.HandleInfoRequest(req)
 	})
 
-	c.ControlsHandler = cmnd.NewHandler(
+	return c
+}
+
+func (caster *Caster) MakePlayback(client *Client, id osp.RemotePlaybackId) *Playback {
+	c := new(Playback)
+	c.client = client
+	c.Id = id
+	c.ControlsChan = make(chan osp.RemotePlaybackControls, 1)
+	c.client.ControlsHandler = cmnd.NewHandler(
 		cmnd.HandlerArg{
 			Name: "toggle_pause",
 			Runner: func(args []string) error {
@@ -592,37 +620,37 @@ func (c *Client) HandleInfoRequest(req *osp.AgentInfoRequest) {
 	osp.SendMessage(c.Conn, msg)
 }
 
-func (c *Client) IsPlaying() bool {
-	c.playingMu.RLock()
-	defer c.playingMu.RUnlock()
-	return c.playing
+func (play *Playback) IsPlaying() bool {
+	play.playingMu.RLock()
+	defer play.playingMu.RUnlock()
+	return play.playing
 }
 
-func (c *Client) SetPlaying(playing bool) {
-	c.playingMu.Lock()
-	defer c.playingMu.Unlock()
-	c.playing = playing
+func (play *Playback) SetPlaying(playing bool) {
+	play.playingMu.Lock()
+	defer play.playingMu.Unlock()
+	play.playing = playing
 }
 
-func (c *Client) GetState() osp.RemotePlaybackState {
-	c.stateMu.RLock()
-	defer c.stateMu.RUnlock()
+func (play *Playback) GetState() osp.RemotePlaybackState {
+	play.stateMu.RLock()
+	defer play.stateMu.RUnlock()
 
-	return c.state
+	return play.state
 }
 
-func (c *Client) SetState(state osp.RemotePlaybackState) {
-	c.stateMu.Lock()
-	defer c.stateMu.Unlock()
+func (play *Playback) SetState(state osp.RemotePlaybackState) {
+	play.stateMu.Lock()
+	defer play.stateMu.Unlock()
 
-	c.state = state
+	play.state = state
 }
 
-func (c *Client) MergeState(state osp.RemotePlaybackState) {
-	c.stateMu.Lock()
-	defer c.stateMu.Unlock()
+func (play *Playback) MergeState(state osp.RemotePlaybackState) {
+	play.stateMu.Lock()
+	defer play.stateMu.Unlock()
 
-	c.state = osp.MergeStates(c.state, state)
+	play.state = osp.MergeStates(play.state, state)
 }
 
 func (c *Client) GetAgentCapabilities() *osp.AuthCapabilities {
@@ -789,14 +817,14 @@ func (c *Client) Authenticate() ([]byte, error) {
 	return key, nil
 }
 
-func (c *Client) HandleControl(cmd []string) error {
-	if !c.IsPlaying() {
+func (play *Playback) HandleControl(cmd []string) error {
+	if !play.IsPlaying() {
 		return errors.New("nothing is playing right now")
 	}
-	err, ok := c.ControlsHandler.HandleArgs(cmd)
+	err, ok := play.client.ControlsHandler.HandleArgs(cmd)
 	if !ok {
 		fmt.Println("Command not recognized: available commands:")
-		fmt.Print(c.ControlsHandler.GetDescription())
+		fmt.Print(play.client.ControlsHandler.GetDescription())
 		return nil
 	}
 
@@ -809,33 +837,35 @@ func (c *Client) HandleControl(cmd []string) error {
 	return nil
 }
 
-func (c *Client) HandleMedia() error {
+func (play *Playback) HandleMedia() error {
 	retchan := make(chan error)
 	statechan := make(chan osp.RemotePlaybackState)
 	updatechan := make(chan osp.RemotePlaybackState)
 	rchan := make(chan osp.RemotePlaybackTerminationRequestReason)
 	terminationChan := make(chan struct{})
-	go func() { retchan <- PlayMedia(c, *time.NewTicker(time.Second), statechan, terminationChan, updatechan) }()
+	go func() {
+		retchan <- PlayMedia(play, *time.NewTicker(time.Second), statechan, terminationChan, updatechan)
+	}()
 
 	defer close(terminationChan)
 
 	modifyRequestHandler := osp.NewRequestHandler()
-	err := c.MsgHandler.AddRequestHandler(osp.RemotePlaybackModifyResponseKey, modifyRequestHandler)
+	err := play.client.MsgHandler.AddRequestHandler(osp.RemotePlaybackModifyResponseKey, modifyRequestHandler)
 	if err != nil {
 		panic(err)
 	}
 
-	stateEventChan, err := c.MsgHandler.ListenForKey(osp.RemotePlaybackStateEventKey)
+	stateEventChan, err := play.client.MsgHandler.ListenForKey(osp.RemotePlaybackStateEventKey)
 	if err != nil {
 		panic(err)
 	}
 
-	terminationEventChan, err := c.MsgHandler.ListenForKey(osp.RemotePlaybackTerminationEventKey)
+	terminationEventChan, err := play.client.MsgHandler.ListenForKey(osp.RemotePlaybackTerminationEventKey)
 	if err != nil {
 		panic(err)
 	}
 
-	terminationResponseChan, err := c.MsgHandler.ListenForKey(osp.RemotePlaybackTerminationResponseKey)
+	terminationResponseChan, err := play.client.MsgHandler.ListenForKey(osp.RemotePlaybackTerminationResponseKey)
 	if err != nil {
 		panic(err)
 	}
@@ -845,13 +875,13 @@ func (c *Client) HandleMedia() error {
 		case err := <-retchan:
 			slog.Debug("got return")
 			return err
-		case cont := <-c.ControlsChan:
+		case cont := <-play.ControlsChan:
 			slog.Debug("got controls")
 			req := osp.RemotePlaybackModifyRequest{
 				Request: osp.Request{
 					RequestId: osp.RequestId(uuid.New().ID()),
 				},
-				RemotePlaybackId: c.Id,
+				RemotePlaybackId: play.Id,
 				Controls:         cont,
 			}
 
@@ -864,7 +894,7 @@ func (c *Client) HandleMedia() error {
 			}
 
 			slog.Debug("sent modify request")
-			data, err := modifyRequestHandler.SendRequestWithTimeout(c.Conn, req, osp.RemotePlaybackModifyRequestKey, defaultTimeout)
+			data, err := modifyRequestHandler.SendRequestWithTimeout(play.client.Conn, req, osp.RemotePlaybackModifyRequestKey, defaultTimeout)
 			if err != nil {
 				return errors.Join(errors.New("error sending modify request"), err)
 			}
@@ -876,17 +906,17 @@ func (c *Client) HandleMedia() error {
 				break
 			}
 
-			c.MergeState(pointer.ZeroIfNil(modr.State))
+			play.MergeState(pointer.ZeroIfNil(modr.State))
 
 			slog.Debug("sent state")
-			statechan <- c.GetState()
+			statechan <- play.GetState()
 		case s := <-stateEventChan:
 			event := s.(*osp.RemotePlaybackStateEvent)
 
 			statechan <- event.State
-			c.MergeState(event.State)
+			play.MergeState(event.State)
 		case u := <-updatechan:
-			c.MergeState(u)
+			play.MergeState(u)
 		case term := <-terminationEventChan:
 			slog.Debug("got termination event")
 			t := term.(*osp.RemotePlaybackTerminationEvent)
@@ -899,13 +929,13 @@ func (c *Client) HandleMedia() error {
 				Request: osp.Request{
 					RequestId: osp.RequestId(uuid.New().ID()),
 				},
-				RemotePlaybackId: c.Id,
+				RemotePlaybackId: play.Id,
 				Reason:           reason,
 			}
 
 			msg, _ := osp.EncodeMessageWithKey(request, osp.RemotePlaybackTerminationRequestKey)
 
-			osp.SendMessage(c.Conn, msg)
+			osp.SendMessage(play.client.Conn, msg)
 			slog.Debug("sent termination request\n")
 
 			select {
@@ -918,7 +948,7 @@ func (c *Client) HandleMedia() error {
 	}
 }
 
-func PlayMedia(c *Client, t time.Ticker, statechan chan osp.RemotePlaybackState, terminationChan chan struct{}, updatechan chan osp.RemotePlaybackState) error {
+func PlayMedia(c *Playback, t time.Ticker, statechan chan osp.RemotePlaybackState, terminationChan chan struct{}, updatechan chan osp.RemotePlaybackState) error {
 	state := c.GetState()
 	pos := pointer.ZeroIfNil(state.Position)
 	var dur osp.MediaTimeline

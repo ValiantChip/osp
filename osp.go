@@ -14,7 +14,6 @@ import (
 
 	"github.com/CzarJoti/osp/cmd/cast"
 	"github.com/CzarJoti/osp/mdns"
-	"github.com/CzarJoti/osp/open_screen"
 	cmnd "github.com/CzarJoti/uniCommands"
 )
 
@@ -161,7 +160,7 @@ func NewClient() *Client {
 			Description: "exit the program",
 			Runner: func(args []string) error {
 				if c.caster.GetClient() != nil {
-					c.caster.GetClient().Terminate(open_screen.UserTerminatedViaController)
+					c.caster.GetClient().TermEnd()
 				}
 				c.exitChan <- struct{}{}
 				return nil
@@ -257,7 +256,7 @@ func SendAgentCommand(args []string, c *Client) {
 		return
 	}
 
-	handler := client.ControlsHandler
+	handler := client.ControlsHandler()
 	if handler == nil {
 		fmt.Println("no handler available")
 		return
