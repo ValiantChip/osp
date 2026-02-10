@@ -7,8 +7,8 @@ import (
 
 	"crypto/rand"
 
-	randutil "github.com/ValiantChip/goutils/rand"
-	vint "github.com/ValiantChip/osp/variable_int"
+	randutil "github.com/CzarJoti/goutils/rand"
+	vint "github.com/CzarJoti/osp/variable_int"
 	"github.com/fxamacker/cbor/v2"
 	"github.com/quic-go/quic-go"
 )
@@ -28,12 +28,8 @@ func CalculateBitsOfEntropy(dictionary []byte) float64 {
 
 func SeperateVint(buff []byte) (uint64, []byte) {
 	b := buff[0]
-	prefix := b >> 6
-	length := 1 << prefix
-	var key uint64 = uint64(b & 0x3f)
-	for i := 1; i < int(length); i++ {
-		key = key<<8 + uint64(buff[i])
-	}
+	length := vint.GetLength(b)
+	key := vint.GetValue(buff, length)
 
 	return key, buff[length:]
 }
@@ -222,7 +218,64 @@ func MergeRemotePlaybackControls(a RemotePlaybackControls, b RemotePlaybackContr
 	return a
 }
 
-type TypeKey uint64
+type TypeKey = uint64
+
+const NUM_MESSAGES = 46
+
+type GetZeroVal func() any
+
+var typeMap = map[TypeKey]GetZeroVal{
+	AuthCapabilitiesKey:                    func() any { return new(AuthCapabilities) },
+	AuthSpake2HandshakeKey:                 func() any { return new(AuthSpake2Handshake) },
+	AuthSpake2ConfirmationKey:              func() any { return new(AuthSpake2Confirmation) },
+	AuthStatusKey:                          func() any { return new(AuthStatus) },
+	AgentInfoRequestKey:                    func() any { return new(AgentInfoRequest) },
+	AgentInfoResponseKey:                   func() any { return new(AgentInfoResponse) },
+	AgentInfoEventKey:                      func() any { return new(AgentInfoEvent) },
+	AgentStatusRequestKey:                  func() any { return new(AgentStatusRequest) },
+	PresentationUrlAvailabilityRequestKey:  func() any { return new(PresentationUrlAvailabilityRequest) },
+	PresentationUrlAvailabilityResponseKey: func() any { return new(PresentationUrlAvailabilityResponse) },
+	PresentationUrlAvailabilityEventKey:    func() any { return new(PresentationUrlAvailabilityEvent) },
+	PresentationStartRequestKey:            func() any { return new(PresentationStartRequest) },
+	PresentationStartResponseKey:           func() any { return new(PresentationStartResponse) },
+	PresentationTerminationRequestKey:      func() any { return new(PresentationTerminationRequest) },
+	PresentationTerminationResponseKey:     func() any { return new(PresentationTerminationResponse) },
+	PresentationTerminationEventKey:        func() any { return new(PresentationTerminationEvent) },
+	PresentationConnectionOpenRequestKey:   func() any { return new(PresentationConnectionOpenRequest) },
+	PresentationConnectionOpenResponseKey:  func() any { return new(PresentationConnectionOpenResponse) },
+	PresentationConnectionCloseEventKey:    func() any { return new(PresentationConnectionCloseEvent) },
+	PresentationChangeEventKey:             func() any { return new(PresentationChangeEvent) },
+	PresentationConnectionMessageKey:       func() any { return new(PresentationConnectionMessage) },
+	RemotePlaybackAvailabilityRequestKey:   func() any { return new(RemotePlaybackAvailabilityRequest) },
+	RemotePlaybackAvailabilityResponseKey:  func() any { return new(RemotePlaybackAvailabilityResponse) },
+	RemotePlaybackAvailabilityEventKey:     func() any { return new(RemotePlaybackAvailabilityEvent) },
+	RemotePlaybackStartRequestKey:          func() any { return new(RemotePlaybackStartRequest) },
+	RemotePlaybackStartResponseKey:         func() any { return new(RemotePlaybackStartResponse) },
+	RemotePlaybackTerminationRequestKey:    func() any { return new(RemotePlaybackTerminationRequest) },
+	RemotePlaybackTerminationResponseKey:   func() any { return new(RemotePlaybackTerminationResponse) },
+	RemotePlaybackTerminationEventKey:      func() any { return new(RemotePlaybackTerminationEvent) },
+	RemotePlaybackModifyRequestKey:         func() any { return new(RemotePlaybackModifyRequest) },
+	RemotePlaybackModifyResponseKey:        func() any { return new(RemotePlaybackModifyResponse) },
+	RemotePlaybackStateEventKey:            func() any { return new(RemotePlaybackStateEvent) },
+	AudioFrameKey:                          func() any { return new(AudioFrame) },
+	VideoFrameKey:                          func() any { return new(VideoFrame) },
+	DataFrameKey:                           func() any { return new(DataFrame) },
+	StreamingCapabilitiesRequestKey:        func() any { return new(StreamingCapabilitiesRequest) },
+	StreamingCapabilitiesResponseKey:       func() any { return new(StreamingCapabilitiesResponse) },
+	StreamingSessionStartRequestKey:        func() any { return new(StreamingSessionStartRequest) },
+	StreamingSessionStartResponseKey:       func() any { return new(StreamingSessionStartResponse) },
+	StreamingSessionModifyRequestKey:       func() any { return new(StreamingSessionModifyRequest) },
+	StreamingSessionModifyResponseKey:      func() any { return new(StreamingSessionModifyResponse) },
+	StreamingSessionTerminateRequestKey:    func() any { return new(StreamingSessionTerminateRequest) },
+	StreamingSessionTerminateResponseKey:   func() any { return new(StreamingSessionTerminateResponse) },
+	StreamingSessionTerminateEventKey:      func() any { return new(StreamingSessionTerminateEvent) },
+	StreamingSessionSenderStatsEventKey:    func() any { return new(StreamingSessionSenderStatsEvent) },
+	StreamingSessionReceiverStatsEventKey:  func() any { return new(StreamingSessionReceiverStatsEvent) },
+}
+
+func GetVal(key TypeKey) any {
+	return typeMap[key]()
+}
 
 type PskInputMethod uint32
 

@@ -12,10 +12,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ValiantChip/osp/cmd/cast"
-	"github.com/ValiantChip/osp/mdns"
-	"github.com/ValiantChip/osp/open_screen"
-	cmnd "github.com/ValiantChip/uniCommands"
+	"github.com/CzarJoti/osp/cmd/cast"
+	"github.com/CzarJoti/osp/mdns"
+	"github.com/CzarJoti/osp/open_screen"
+	cmnd "github.com/CzarJoti/uniCommands"
 )
 
 var clientPort = 7938
@@ -35,6 +35,7 @@ type Client struct {
 	doneChan       chan error
 	exitChan       chan struct{}
 	commandHandler *cmnd.Handler
+	agentHandler   *cmnd.Handler
 }
 
 func NewClient() *Client {
@@ -42,6 +43,7 @@ func NewClient() *Client {
 	c.caster = cast.NewCaster(clientPort, slog.Default())
 	c.doneChan = make(chan error, 1)
 	c.exitChan = make(chan struct{}, 1)
+
 	c.commandHandler = cmnd.NewHandler(cmnd.HandlerArg{
 		Name:        "cast",
 		Description: "Usage: cast <hostname> <filename>\nCasts the file at <filename> to the open screen agent at <hostname>",
@@ -145,19 +147,11 @@ func NewClient() *Client {
 			Name:        "agent",
 			Description: "Usage: agent <command> (args)...\nSends a command to the currently casting agent\ntype \"agent help\" for more information",
 			Runner: func(args []string) error {
-				if c.caster.GetClient() == nil {
-					fmt.Println("no agent is currently casting")
-					return nil
-				}
-
 				if len(args) < 2 {
 					fmt.Println("not enough arguments to call agent need: agent <command> (args)...")
 				}
 
-				err := c.caster.GetClient().HandleControl(args[1:])
-				if err != nil {
-					fmt.Println(err.Error())
-				}
+				c.agentHandler.HandleArgs(args[1:])
 
 				return nil
 			},
@@ -182,7 +176,94 @@ func NewClient() *Client {
 			},
 		})
 
+	c.agentHandler = cmnd.NewHandler(
+		cmnd.HandlerArg{
+			Name:        "toggle_pause",
+			Description: "toggles if the player is paused",
+			Runner: func(args []string) error {
+				SendAgentCommand(args, c)
+				return nil
+			},
+		},
+		cmnd.HandlerArg{
+			Name:        "toggle_mute",
+			Description: "toggles if the player is muted",
+			Runner: func(args []string) error {
+				SendAgentCommand(args, c)
+				return nil
+			},
+		},
+		cmnd.HandlerArg{
+			Name:        "seek",
+			Description: "Usage: seek <time>\nseek to a specific time in the media: Use HH:MM:SS",
+			Runner: func(args []string) error {
+				SendAgentCommand(args, c)
+				return nil
+			},
+		},
+		cmnd.HandlerArg{
+			Name:        "current_position",
+			Description: "print the current position of the player that is playing the cast media",
+			Runner: func(args []string) error {
+				SendAgentCommand(args, c)
+				return nil
+			},
+		},
+		cmnd.HandlerArg{
+			Name:        "media_duration",
+			Description: "print the duration of the media that is casting",
+			Runner: func(args []string) error {
+				SendAgentCommand(args, c)
+				return nil
+			},
+		},
+		cmnd.HandlerArg{
+			Name:        "set_volume",
+			Description: "Usage: set_volume <0-100>\nsets the volume of the media player",
+			Runner: func(args []string) error {
+				SendAgentCommand(args, c)
+				return nil
+			},
+		},
+		cmnd.HandlerArg{
+			Name:        "quit",
+			Description: "terminate the player and stop casting",
+			Runner: func(args []string) error {
+				SendAgentCommand(args, c)
+				return nil
+			},
+		},
+		cmnd.HandlerArg{
+			Name:        "help",
+			Description: "print this message",
+			Runner: func(args []string) error {
+				fmt.Println("Available commands:")
+				fmt.Print(c.agentHandler.GetDescription())
+				return nil
+			},
+		},
+	)
 	return c
+}
+
+func SendAgentCommand(args []string, c *Client) {
+	if c.caster == nil {
+		fmt.Println("no agent is casting")
+		return
+	}
+	client := c.caster.GetClient()
+	if client == nil {
+		fmt.Println("no agent is casting")
+		return
+	}
+
+	handler := client.ControlsHandler
+	if handler == nil {
+		fmt.Println("no handler available")
+		return
+	}
+
+	handler.HandleArgs(args)
 }
 
 func ReturnWithExitCode() int {

@@ -5,25 +5,24 @@ import (
 	"log/slog"
 )
 
-type Handler func([]byte)
+type Handler func(data any)
 
 type MessageHandler struct {
-	handlers map[TypeKey]func([]byte)
+	handlers map[TypeKey]Handler
 }
 
 func NewMessageHandler() *MessageHandler {
 	return &MessageHandler{
-		handlers: make(map[TypeKey]func([]byte)),
+		handlers: make(map[TypeKey]Handler),
 	}
 }
 
 var ErrHandlerNotFound = errors.New("handler not found")
 
-func (m *MessageHandler) HandleMessage(msg []byte) error {
-	key, msg := SeperateVint(msg)
-	slog.Debug("received message", "key", key)
+func (m *MessageHandler) HandleData(key TypeKey, data any) error {
+	slog.Debug("received data", "key", key)
 	if handler, ok := m.handlers[TypeKey(key)]; ok {
-		handler(msg)
+		handler(data)
 		return nil
 	}
 	return ErrHandlerNotFound
@@ -39,10 +38,10 @@ func (m *MessageHandler) AddHandler(key TypeKey, handler Handler) error {
 	return nil
 }
 
-func (m *MessageHandler) ListenForKey(key TypeKey) (chan []byte, error) {
-	retChan := make(chan []byte)
-	err := m.AddHandler(key, func(b []byte) {
-		retChan <- b
+func (m *MessageHandler) ListenForKey(key TypeKey) (chan any, error) {
+	retChan := make(chan any)
+	err := m.AddHandler(key, func(data any) {
+		retChan <- data
 	})
 	if err != nil {
 		return nil, err
@@ -51,7 +50,7 @@ func (m *MessageHandler) ListenForKey(key TypeKey) (chan []byte, error) {
 }
 
 func (m *MessageHandler) AddRequestHandler(responseKey TypeKey, r *RequestHandler) error {
-	return m.AddHandler(responseKey, func(b []byte) {
-		r.HandleResponse(b)
+	return m.AddHandler(responseKey, func(data any) {
+		r.HandleResponse(data)
 	})
 }

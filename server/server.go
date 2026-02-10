@@ -26,16 +26,15 @@ import (
 	"time"
 
 	vlc "github.com/ValiantChip/libvlc-go"
-	"github.com/fxamacker/cbor/v2"
 	"github.com/hashicorp/mdns"
 	"github.com/quic-go/quic-go"
 	"gopkg.in/yaml.v3"
 
-	spake2 "github.com/ValiantChip/gospake2"
-	"github.com/ValiantChip/goutils/pointer"
-	randutil "github.com/ValiantChip/goutils/rand"
-	osp "github.com/ValiantChip/osp/open_screen"
-	vint "github.com/ValiantChip/osp/variable_int"
+	spake2 "github.com/CzarJoti/gospake2"
+	"github.com/CzarJoti/goutils/pointer"
+	randutil "github.com/CzarJoti/goutils/rand"
+	osp "github.com/CzarJoti/osp/open_screen"
+	vint "github.com/CzarJoti/osp/variable_int"
 )
 
 const auth = "auth"
@@ -311,9 +310,24 @@ type Agent struct {
 	loop               bool
 	LoopMu             sync.RWMutex
 	stateMu            sync.RWMutex
+	strState           StreamState
+	strMu              sync.RWMutex
 	capabilitiesRecv   chan bool
 	doneChan           chan error
 	Handlers           map[string]*osp.MessageHandler
+}
+
+type StreamState struct {
+	StatsInterval osp.Microseconds
+	StreamId      uint32
+	Str           Stream
+}
+
+type Stream struct {
+	Id      uint32
+	AudioId uint32
+	VideoId uint32
+	DataId  uint32
 }
 
 func (s *Server) NewAgent(conn *quic.Conn) *Agent {
@@ -329,52 +343,46 @@ func (s *Server) NewAgent(conn *quic.Conn) *Agent {
 	a.Handlers = make(map[string]*osp.MessageHandler)
 	a.Handlers[info] = infoHandler
 	a.Handlers[auth] = authHandler
-	authHandler.AddHandler(osp.AuthCapabilitiesKey, func(msg []byte) {
-		a.HandleAuthCapabilities(msg)
+	authHandler.AddHandler(osp.AuthCapabilitiesKey, func(data any) {
+		a.HandleAuthCapabilities(data.(*osp.AuthCapabilities))
 	})
 
-	infoHandler.AddHandler(osp.AgentInfoRequestKey, func(msg []byte) {
-		a.HandleInfoRequest(msg)
+	infoHandler.AddHandler(osp.AgentInfoRequestKey, func(data any) {
+		a.HandleInfoRequest(data.(*osp.AgentInfoRequest))
 	})
 
 	return a
 }
 
-func (a *Agent) HandleInfoRequest(msg []byte) {
+func (a *Agent) HandleInfoRequest(req *osp.AgentInfoRequest) {
 	a.Server.Logger.Info("received info request")
-	var req osp.AgentInfoRequest
-	err := cbor.Unmarshal(msg, &req)
-	if err != nil {
-		return
-	}
-
 	rsp := osp.AgentInfoResponse{
 		Response:  osp.Response{ResponseId: osp.ResponseId(req.RequestId)},
 		AgentInfo: a.AgentInfo,
 	}
 
-	msg, _ = osp.EncodeMessageWithKey(rsp, osp.AgentInfoResponseKey)
+	msg, _ := osp.EncodeMessageWithKey(rsp, osp.AgentInfoResponseKey)
 	osp.SendMessage(a.Conn, msg)
 }
 
 func (a *Agent) InitApplication() {
 	msgHandler := osp.NewMessageHandler()
 	a.Handlers[app] = msgHandler
-	msgHandler.AddHandler(osp.StreamingSessionStartRequestKey, func(msg []byte) {
-		a.HandleStreamingSessionStartRequest(msg)
+	msgHandler.AddHandler(osp.StreamingSessionStartRequestKey, func(data any) {
+		a.HandleStreamingSessionStartRequest(data.(*osp.StreamingSessionStartRequest))
 	})
-	msgHandler.AddHandler(osp.StreamingCapabilitiesRequestKey, func(msg []byte) {
-		a.HandleStreamingCapabilitiesRequest(msg)
+	msgHandler.AddHandler(osp.StreamingCapabilitiesRequestKey, func(data any) {
+		a.HandleStreamingCapabilitiesRequest(data.(*osp.StreamingCapabilitiesRequest))
 	})
-	msgHandler.AddHandler(osp.RemotePlaybackAvailabilityRequestKey, func(msg []byte) {
-		a.HandleRemotePlaybackAvailabilityRequest(msg)
+	msgHandler.AddHandler(osp.RemotePlaybackAvailabilityRequestKey, func(data any) {
+		a.HandleRemotePlaybackAvailabilityRequest(data.(*osp.RemotePlaybackAvailabilityRequest))
 	})
-	msgHandler.AddHandler(osp.PresentationStartRequestKey, func(msg []byte) {
-		a.HandlePresentationStartRequest(msg)
+	msgHandler.AddHandler(osp.PresentationStartRequestKey, func(data any) {
+		a.HandlePresentationStartRequest(data.(*osp.PresentationStartRequest))
 	})
 
-	msgHandler.AddHandler(osp.RemotePlaybackStartRequestKey, func(msg []byte) {
-		a.HandleRemotePlaybackStartRequest(msg)
+	msgHandler.AddHandler(osp.RemotePlaybackStartRequestKey, func(data any) {
+		a.HandleRemotePlaybackStartRequest(data.(*osp.RemotePlaybackStartRequest))
 	})
 }
 
@@ -400,6 +408,18 @@ func (a *Agent) SetState(state osp.RemotePlaybackState) {
 	a.stateMu.Lock()
 	defer a.stateMu.Unlock()
 	a.state = state
+}
+
+func (a *Agent) GetStr() StreamState {
+	a.strMu.RLock()
+	defer a.strMu.RUnlock()
+	return a.strState
+}
+
+func (a *Agent) SetStr(state StreamState) {
+	a.strMu.Lock()
+	defer a.strMu.Unlock()
+	a.strState = state
 }
 
 func (a *Agent) GetClientCapabilities() *osp.AuthCapabilities {
@@ -471,16 +491,8 @@ func (agent *Agent) RunProtocol() {
 	agent.InitApplication()
 }
 
-func (agent *Agent) HandleRemotePlaybackStartRequest(request []byte) {
+func (agent *Agent) HandleRemotePlaybackStartRequest(req *osp.RemotePlaybackStartRequest) {
 	agent.Server.Logger.Info("handling remote playback start request")
-	req := new(osp.RemotePlaybackStartRequest)
-	err := cbor.Unmarshal(request, req)
-	if err != nil {
-		agent.Server.Logger.Error(fmt.Sprintf("error unmarshalling remote playback start request: %s", err.Error()))
-		return
-	}
-
-	agent.Server.Logger.Info("received remote playback start request")
 
 	agent.clientInfo.PlaybackId = req.RemotePlaybackId
 
@@ -512,7 +524,7 @@ func (agent *Agent) HandleRemotePlaybackStartRequest(request []byte) {
 	}
 
 	msg, _ := osp.EncodeMessageWithKey(rsp, osp.RemotePlaybackStartResponseKey)
-	err = osp.SendMessage(agent.Conn, msg)
+	err := osp.SendMessage(agent.Conn, msg)
 	if err != nil {
 		agent.Server.Logger.Error(fmt.Sprintf("error sending remote playback start response: %s", err.Error()))
 		return
@@ -526,11 +538,7 @@ func (agent *Agent) HandleRemotePlaybackStartRequest(request []byte) {
 	}
 
 	var reqControls osp.RemotePlaybackControls
-	if req.Controls != nil {
-		reqControls = *req.Controls
-	} else {
-		reqControls = osp.RemotePlaybackControls{}
-	}
+	reqControls = pointer.ValIfNil(req.Controls, osp.RemotePlaybackControls{})
 
 	reqControls = osp.MergeRemotePlaybackControls(reqControls, default_controls)
 
@@ -667,14 +675,9 @@ func (a *Agent) HandleMedia(initcontrols osp.RemotePlaybackControls, initState o
 
 	for {
 		select {
-		case msg := <-remoteModifyRequestChan:
+		case data := <-remoteModifyRequestChan:
 			a.Server.Logger.Info("received remote playback modify request")
-			req := new(osp.RemotePlaybackModifyRequest)
-			err := cbor.Unmarshal(msg, req)
-			if err != nil {
-				a.Server.Logger.Error(fmt.Sprintf("error unmarshalling remote playback modify request: %s", err.Error()))
-				return osp.UnknownRemotePlaybackTerminationEventReason
-			}
+			req := data.(*osp.RemotePlaybackModifyRequest)
 
 			if req.RemotePlaybackId != a.clientInfo.PlaybackId {
 				a.Server.Logger.Error("remote playback id mismatch")
@@ -911,12 +914,12 @@ func (a *Agent) Listen() {
 
 func (a *Agent) HandleStream(stream *quic.ReceiveStream) {
 	defer stream.CancelRead(quic.StreamErrorCode(quic.InternalError))
-	buff := make([]byte, 9000)
+	s := osp.NewScanner(stream)
 	for {
-		n, err := stream.Read(buff)
-		if err != nil && !errors.Is(err, io.EOF) {
+		ok := s.Scan()
+		if !ok {
 			val := new(quic.StreamError)
-			if errors.As(err, &val) {
+			if errors.As(s.Err(), &val) {
 				code := val.ErrorCode
 				if code == 5139 {
 					a.Server.Logger.Error("connection closed")
@@ -924,13 +927,11 @@ func (a *Agent) HandleStream(stream *quic.ReceiveStream) {
 			}
 			return
 		}
-		if n == 0 {
-			return
-		}
 
+		key, data := s.GetVal()
 		errChan := make(chan error, len(a.Handlers))
 		for _, h := range a.Handlers {
-			go func() { errChan <- h.HandleMessage(buff[:n]) }()
+			go func() { errChan <- h.HandleData(key, data) }()
 		}
 
 		errs := make([]error, 0, len(a.Handlers))
@@ -954,99 +955,75 @@ func (a *Agent) HandleStream(stream *quic.ReceiveStream) {
 	}
 }
 
-func (a *Agent) HandleRemotePlaybackAvailabilityRequest(msg []byte) {
-	req := new(osp.RemotePlaybackAvailabilityRequest)
-	err := cbor.Unmarshal(msg, req)
-	if err != nil {
-		a.Server.Logger.Error(fmt.Sprintf("error unmarshalling availability request: %s", err.Error()))
-	}
+func (a *Agent) HandleRemotePlaybackAvailabilityRequest(req *osp.RemotePlaybackAvailabilityRequest) {
 	availabilities := GetAvailabilities(req.Sources, false)
 	rsp := osp.RemotePlaybackAvailabilityResponse{
 		Response:          osp.Response{ResponseId: osp.ResponseId(req.RequestId)},
 		UrlAvailabilities: availabilities,
 	}
 
-	msg, _ = osp.EncodeMessageWithKey(rsp, osp.RemotePlaybackAvailabilityResponseKey)
+	msg, _ := osp.EncodeMessageWithKey(rsp, osp.RemotePlaybackAvailabilityResponseKey)
 
-	err = osp.SendMessage(a.Conn, msg)
+	err := osp.SendMessage(a.Conn, msg)
 	if err != nil {
 		a.Server.Logger.Error(fmt.Sprintf("error sending availability response: %s", err.Error()))
 		return
 	}
 }
 
-func (a *Agent) HandleStreamingSessionStartRequest(msg []byte) {
-	req := new(osp.StreamingSessionStartRequest)
-	err := cbor.Unmarshal(msg, req)
-	if err != nil {
-		a.Server.Logger.Error(fmt.Sprintf("error unmarshalling start request: %s", err.Error()))
-		return
+func (a *Agent) HandleStreamingSessionStartRequest(req *osp.StreamingSessionStartRequest) {
+	if len(req.StreamOffers) == 0 {
+		a.Server.Logger.Error("no available offers")
+		rsp := osp.StreamingSessionStartResponse{
+			Response: osp.Response{ResponseId: osp.ResponseId(req.RequestId)},
+		}
+
+		msg, _ := osp.EncodeMessageWithKey(rsp, osp.StreamingSessionStartResponseKey)
+
+		err := osp.SendMessage(a.Conn, msg)
+		if err != nil {
+			a.Server.Logger.Error(fmt.Sprintf("error sending start response: %s", err.Error()))
+			return
+		}
 	}
 
-	rsp := osp.StreamingSessionStartResponse{
-		Response: osp.Response{ResponseId: osp.ResponseId(req.RequestId)},
-		StreamingSessionStartResponseParams: osp.StreamingSessionStartResponseParams{
-			Result: osp.Terminating,
-		},
-	}
+	//offer := req.StreamOffers[0]
+	//statsInt := req.DesiredStatsInterval
 
-	msg, _ = osp.EncodeMessageWithKey(rsp, osp.StreamingSessionStartResponseKey)
-
-	err = osp.SendMessage(a.Conn, msg)
-	if err != nil {
-		a.Server.Logger.Error(fmt.Sprintf("error sending start response: %s", err.Error()))
-		return
-	}
 }
 
-func (a *Agent) HandleStreamingCapabilitiesRequest(msg []byte) {
-	req := new(osp.StreamingCapabilitiesRequest)
-	err := cbor.Unmarshal(msg, req)
-	if err != nil {
-		a.Server.Logger.Error(fmt.Sprintf("error unmarshalling capabilities request: %s", err.Error()))
+func (a *Agent) HandleStreamingCapabilitiesRequest(req *osp.StreamingCapabilitiesRequest) {
+
+	rsp := osp.StreamingCapabilitiesResponse{
+		Response:              osp.Response{ResponseId: osp.ResponseId(req.RequestId)},
+		StreamingCapabilities: osp.StreamingCapabilities{},
 	}
 
-	rsp := osp.StreamingCapabilities{}
+	msg, _ := osp.EncodeMessageWithKey(rsp, osp.StreamingCapabilitiesResponseKey)
 
-	msg, _ = osp.EncodeMessageWithKey(rsp, osp.StreamingCapabilitiesResponseKey)
-
-	err = osp.SendMessage(a.Conn, msg)
+	err := osp.SendMessage(a.Conn, msg)
 	if err != nil {
 		a.Server.Logger.Error(fmt.Sprintf("error sending capabilities response: %s", err.Error()))
 		return
 	}
 }
 
-func (a *Agent) HandlePresentationStartRequest(msg []byte) {
-	req := new(osp.PresentationStartRequest)
-	err := cbor.Unmarshal(msg, req)
-	if err != nil {
-		a.Server.Logger.Error(fmt.Sprintf("error unmarshalling start request: %s", err.Error()))
-		return
-	}
-
+func (a *Agent) HandlePresentationStartRequest(req *osp.PresentationStartRequest) {
 	rsp := osp.PresentationStartResponse{
 		Response: osp.Response{ResponseId: osp.ResponseId(req.RequestId)},
 		Result:   osp.Terminating,
 	}
 
-	msg, _ = osp.EncodeMessageWithKey(rsp, osp.PresentationStartResponseKey)
+	msg, _ := osp.EncodeMessageWithKey(rsp, osp.PresentationStartResponseKey)
 
-	err = osp.SendMessage(a.Conn, msg)
+	err := osp.SendMessage(a.Conn, msg)
 	if err != nil {
 		a.Server.Logger.Error(fmt.Sprintf("error sending start response: %s", err.Error()))
 		return
 	}
 }
 
-func (a *Agent) HandleAuthCapabilities(msg []byte) {
-	capabilities := &osp.AuthCapabilities{}
-	err := cbor.Unmarshal(msg, capabilities)
-	if err != nil {
-		a.Server.Logger.Error(fmt.Sprintf("error unmarshalling capabilities: %s", err.Error()))
-		return
-	}
-
+func (a *Agent) HandleAuthCapabilities(capabilities *osp.AuthCapabilities) {
 	a.SetClientCapabilities(capabilities)
 	a.capabilitiesRecv <- true
 }
@@ -1149,15 +1126,10 @@ func (a *Agent) Authenticate() ([]byte, error) {
 	}
 	a.Server.Logger.Info("sent spake2 handshake")
 
-	var response osp.AuthSpake2Handshake
-	rsp := <-handshakeChan
+	data := <-handshakeChan
 	a.Server.Logger.Info("received spake2 handshake")
+	response := data.(*osp.AuthSpake2Handshake)
 
-	err = cbor.Unmarshal(rsp, &response)
-	if err != nil {
-		a.Server.Logger.Error(fmt.Sprintf("error unmarshalling spake handshake: %s", err.Error()))
-		return nil, errors.Join(err, errors.New("error unmarshalling spake handshake"))
-	}
 	var key []byte
 	key, msg, err = s.Finish(response.PublicValue)
 	if err != nil {
@@ -1178,13 +1150,9 @@ func (a *Agent) Authenticate() ([]byte, error) {
 	}
 	a.Server.Logger.Info("sent spake2 confirmation")
 
-	rsp = <-confChan
+	data = <-confChan
 	a.Server.Logger.Info("recieved spake2 confirmation")
-	var confrsp osp.AuthSpake2Confirmation
-	err = cbor.Unmarshal(rsp, &confrsp)
-	if err != nil {
-		return nil, errors.Join(err, errors.New("error unmarshalling spake confirmation"))
-	}
+	confrsp := data.(*osp.AuthSpake2Confirmation)
 
 	err = s.Verify(confrsp.Bytes)
 	if err != nil {

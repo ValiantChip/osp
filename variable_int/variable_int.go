@@ -17,3 +17,16 @@ func EncodeVariableInt30(i uint32) ([]byte, error) {
 	binary.BigEndian.PutUint32(bytes, k)
 	return bytes, nil
 }
+
+func GetLength(b byte) int {
+	return 1 << (b >> 6)
+}
+
+func GetValue(b []byte, l int) uint64 {
+	var v uint64 = uint64(b[0] & 0x3f)
+	for i := 1; i < int(l); i++ {
+		v = v<<8 + uint64(b[i])
+	}
+
+	return v
+}

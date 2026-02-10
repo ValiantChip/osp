@@ -5,61 +5,65 @@ import (
 	"sync"
 	"time"
 
-	"github.com/fxamacker/cbor/v2"
 	"github.com/quic-go/quic-go"
 )
 
 type RequestHandler struct {
-	requests   map[RequestId]chan []byte
+	requests   map[RequestId]chan any
 	requestsMu sync.RWMutex
 }
 
 func NewRequestHandler() *RequestHandler {
 	return &RequestHandler{
-		requests: make(map[RequestId]chan []byte),
+		requests: make(map[RequestId]chan any),
 	}
 }
 
-func (r *RequestHandler) SendRequestAndWait(conn *quic.Conn, request OspRequest, response any, key TypeKey) error {
+func (r *RequestHandler) SendRequestAndWait(conn *quic.Conn, request OspRequest, key TypeKey) (any, error) {
 
 	msg, err := EncodeMessageWithKey(request, key)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	err = SendMessage(conn, msg)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	rspChan, err := r.registerRequest(request)
+	dataChan, err := r.registerRequest(request)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	rsp := <-rspChan
-	return cbor.Unmarshal(rsp, response)
+	data := <-dataChan
+	return data, nil
 }
 
 var ErrRequestTimeout = errors.New("request timed out")
 
-func (r *RequestHandler) SendRequestWithTimeout(conn *quic.Conn, request OspRequest, response any, key TypeKey, timeout time.Duration) error {
-	retChan := make(chan error)
+type returnVal struct {
+	data any
+	err  error
+}
+
+func (r *RequestHandler) SendRequestWithTimeout(conn *quic.Conn, request OspRequest, key TypeKey, timeout time.Duration) (any, error) {
+	retChan := make(chan returnVal)
 	go func() {
-		err := r.SendRequestAndWait(conn, request, response, key)
-		retChan <- err
+		data, err := r.SendRequestAndWait(conn, request, key)
+		retChan <- returnVal{data, err}
 	}()
 	select {
-	case err := <-retChan:
-		return err
+	case ret := <-retChan:
+		return ret.data, ret.err
 	case <-time.After(timeout):
 		r.cancelRequest(request)
-		return ErrRequestTimeout
+		return nil, ErrRequestTimeout
 	}
 }
 
 var errRequestExists = errors.New("request already exists")
 
-func (r *RequestHandler) registerRequest(request OspRequest) (chan []byte, error) {
+func (r *RequestHandler) registerRequest(request OspRequest) (chan any, error) {
 	r.requestsMu.RLock()
 	if _, ok := r.requests[request.GetId()]; ok {
 		r.requestsMu.RUnlock()
@@ -69,7 +73,7 @@ func (r *RequestHandler) registerRequest(request OspRequest) (chan []byte, error
 
 	r.requestsMu.Lock()
 	defer r.requestsMu.Unlock()
-	rspChan := make(chan []byte)
+	rspChan := make(chan any)
 	r.requests[request.GetId()] = rspChan
 	return rspChan, nil
 }
@@ -80,15 +84,14 @@ func (r *RequestHandler) cancelRequest(request OspRequest) {
 	delete(r.requests, request.GetId())
 }
 
-func (r *RequestHandler) HandleResponse(rsp []byte) {
+func (r *RequestHandler) HandleResponse(data any) {
 	r.requestsMu.Lock()
 	defer r.requestsMu.Unlock()
-	response := Response{}
-	cbor.Unmarshal(rsp, &response)
+	response := data.(OspResponse)
 	rspChan, ok := r.requests[RequestId(response.GetId())]
 	if !ok {
 		return
 	}
 	delete(r.requests, RequestId(response.GetId()))
-	rspChan <- rsp
+	rspChan <- data
 }

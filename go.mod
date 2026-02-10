@@ -1,10 +1,10 @@
-module github.com/ValiantChip/osp
+module github.com/CzarJoti/osp
 
 go 1.24.6
 
 require (
 	filippo.io/edwards25519 v1.1.0
-	github.com/ValiantChip/goutils v0.1.3
+	github.com/CzarJoti/goutils v0.1.4
 	github.com/fxamacker/cbor/v2 v2.9.0
 	github.com/miekg/dns v1.1.68 // indirect
 	github.com/quic-go/quic-go v0.54.0
@@ -12,9 +12,9 @@ require (
 )
 
 require (
-	github.com/ValiantChip/gospake2 v0.1.5
+	github.com/CzarJoti/gospake2 v0.1.6
 	github.com/ValiantChip/libvlc-go v0.1.1
-	github.com/ValiantChip/uniCommands v0.1.1
+	github.com/CzarJoti/uniCommands v0.1.2
 	github.com/gabriel-vasile/mimetype v1.4.10
 	github.com/google/uuid v1.6.0
 )

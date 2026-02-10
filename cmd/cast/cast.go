@@ -12,7 +12,6 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"math"
 	"math/big"
@@ -23,17 +22,16 @@ import (
 	"sync"
 	"time"
 
-	osp "github.com/ValiantChip/osp/open_screen"
+	osp "github.com/CzarJoti/osp/open_screen"
 	"github.com/google/uuid"
 
-	"github.com/fxamacker/cbor/v2"
 	"github.com/quic-go/quic-go"
 
-	spake2 "github.com/ValiantChip/gospake2"
-	"github.com/ValiantChip/goutils/pointer"
-	randutil "github.com/ValiantChip/goutils/rand"
-	sliceutil "github.com/ValiantChip/goutils/slices"
-	cmnd "github.com/ValiantChip/uniCommands"
+	spake2 "github.com/CzarJoti/gospake2"
+	"github.com/CzarJoti/goutils/pointer"
+	randutil "github.com/CzarJoti/goutils/rand"
+	sliceutil "github.com/CzarJoti/goutils/slices"
+	cmnd "github.com/CzarJoti/uniCommands"
 	"github.com/gabriel-vasile/mimetype"
 )
 
@@ -206,8 +204,7 @@ func (c *Caster) VerifyDevice(ip net.IP, port int, timeout time.Duration) error 
 		}
 
 		slog.Debug("sending agent info request")
-		var rsp osp.AgentInfoResponse
-		err = requestHandler.SendRequestWithTimeout(client.Conn, request, &rsp, osp.AgentInfoRequestKey, timeout)
+		data, err := requestHandler.SendRequestWithTimeout(client.Conn, request, osp.AgentInfoRequestKey, timeout)
 		if err != nil {
 			if errors.Is(err, osp.ErrRequestTimeout) {
 				slog.Debug("request timed out")
@@ -218,6 +215,8 @@ func (c *Caster) VerifyDevice(ip net.IP, port int, timeout time.Duration) error 
 		} else {
 			slog.Debug("received agent info response")
 		}
+
+		rsp := data.(osp.AgentInfoResponse)
 
 		if !sliceutil.ContainsAll(rsp.AgentInfo.Capabilities, requiredCapabilities) {
 			slog.Debug("missing required capabilities")
@@ -241,6 +240,18 @@ func (c *Caster) VerifyDevice(ip net.IP, port int, timeout time.Duration) error 
 			return nil
 		}
 	}
+}
+
+func (c *Caster) Stream(ip net.IP, serverPort int, filename string) error {
+	var fl *os.File
+	var err error
+	if fl, err = os.Open(filename); err != nil {
+		slog.Error("failed to open file: %s", "error", err.Error())
+		return errors.New("failed to open file")
+	}
+	defer fl.Close()
+
+	return nil
 }
 
 func (c *Caster) Cast(ip net.IP, serverPort int, videoPort int, filename string, at string) error {
@@ -345,14 +356,15 @@ func (client *Client) HandleProtocol(port int, videoPort int, mimeType string) e
 		Sources:          &sources,
 	}
 
-	var response osp.RemotePlaybackStartResponse
 	slog.Debug("sent start request")
-	err = startRequestHandler.SendRequestWithTimeout(client.Conn, request, &response, osp.RemotePlaybackStartRequestKey, defaultTimeout)
+	data, err := startRequestHandler.SendRequestWithTimeout(client.Conn, request, osp.RemotePlaybackStartRequestKey, defaultTimeout)
 	if err != nil {
 		slog.Error("error sending start request")
 		return err
 	}
 	slog.Debug("got start response")
+
+	response := data.(*osp.RemotePlaybackStartResponse)
 
 	if response.State == nil {
 		slog.Error("request refused")
@@ -464,19 +476,20 @@ func (caster *Caster) MakeClient(fingerprint string, conn *quic.Conn, capabiliti
 	c.ControlsChan = make(chan osp.RemotePlaybackControls, 1)
 	c.MsgHandler = osp.NewMessageHandler()
 	if handleAuthentication {
-		c.MsgHandler.AddHandler(osp.AuthCapabilitiesKey, func(msg []byte) {
-			c.HandleAuthCapabilities(msg)
+		c.MsgHandler.AddHandler(osp.AuthCapabilitiesKey, func(data any) {
+			cap := data.(*osp.AuthCapabilities)
+			c.HandleAuthCapabilities(cap)
 		})
 	}
 
-	c.MsgHandler.AddHandler(osp.AgentInfoRequestKey, func(msg []byte) {
-		c.HandleInfoRequest(msg)
+	c.MsgHandler.AddHandler(osp.AgentInfoRequestKey, func(data any) {
+		req := data.(*osp.AgentInfoRequest)
+		c.HandleInfoRequest(req)
 	})
 
 	c.ControlsHandler = cmnd.NewHandler(
 		cmnd.HandlerArg{
-			Name:        "toggle_pause",
-			Description: "toggles if the player is paused",
+			Name: "toggle_pause",
 			Runner: func(args []string) error {
 				state := c.GetState()
 				c.ControlsChan <- osp.RemotePlaybackControls{Paused: pointer.New(!pointer.ValIfNil(state.Paused, false))}
@@ -484,8 +497,7 @@ func (caster *Caster) MakeClient(fingerprint string, conn *quic.Conn, capabiliti
 			},
 		},
 		cmnd.HandlerArg{
-			Name:        "toggle_mute",
-			Description: "toggles if the player is muted",
+			Name: "toggle_mute",
 			Runner: func(args []string) error {
 				state := c.GetState()
 				c.ControlsChan <- osp.RemotePlaybackControls{Muted: pointer.New(!pointer.ValIfNil(state.Muted, false))}
@@ -493,8 +505,7 @@ func (caster *Caster) MakeClient(fingerprint string, conn *quic.Conn, capabiliti
 			},
 		},
 		cmnd.HandlerArg{
-			Name:        "seek",
-			Description: "Usage: seek <time>\nseek to a specific time in the media: Use HH:MM:SS",
+			Name: "seek",
 			Runner: func(args []string) error {
 				t := args[1]
 				//TODO: change time parsing to allow for hours > 24
@@ -512,8 +523,7 @@ func (caster *Caster) MakeClient(fingerprint string, conn *quic.Conn, capabiliti
 			},
 		},
 		cmnd.HandlerArg{
-			Name:        "current_position",
-			Description: "print the current position of the player that is playing the cast media",
+			Name: "current_position",
 			Runner: func(args []string) error {
 				position := c.GetState().Position
 				if position == nil {
@@ -530,8 +540,7 @@ func (caster *Caster) MakeClient(fingerprint string, conn *quic.Conn, capabiliti
 			},
 		},
 		cmnd.HandlerArg{
-			Name:        "media_duration",
-			Description: "print the duration of the media that is casting",
+			Name: "media_duration",
 			Runner: func(args []string) error {
 				duration := c.GetState().Duration
 				if duration == nil {
@@ -548,8 +557,7 @@ func (caster *Caster) MakeClient(fingerprint string, conn *quic.Conn, capabiliti
 			},
 		},
 		cmnd.HandlerArg{
-			Name:        "set_volume",
-			Description: "Usage: set_volume <0-100>\nsets the volume of the media player",
+			Name: "set_volume",
 			Runner: func(args []string) error {
 				vol, err := strconv.Atoi(args[1])
 				if err != nil {
@@ -563,19 +571,9 @@ func (caster *Caster) MakeClient(fingerprint string, conn *quic.Conn, capabiliti
 			},
 		},
 		cmnd.HandlerArg{
-			Name:        "quit",
-			Description: "terminate the player and stop casting",
+			Name: "quit",
 			Runner: func(args []string) error {
 				c.Terminate(osp.UserTerminatedViaController)
-				return nil
-			},
-		},
-		cmnd.HandlerArg{
-			Name:        "help",
-			Description: "print this message",
-			Runner: func(args []string) error {
-				fmt.Println("Available commands:")
-				fmt.Print(c.ControlsHandler.GetDescription())
 				return nil
 			},
 		},
@@ -583,19 +581,14 @@ func (caster *Caster) MakeClient(fingerprint string, conn *quic.Conn, capabiliti
 	return c
 }
 
-func (c *Client) HandleInfoRequest(msg []byte) {
-	var req osp.AgentInfoRequest
-	err := cbor.Unmarshal(msg, &req)
-	if err != nil {
-		return
-	}
+func (c *Client) HandleInfoRequest(req *osp.AgentInfoRequest) {
 
 	rsp := osp.AgentInfoResponse{
 		Response:  osp.Response{ResponseId: osp.ResponseId(req.RequestId)},
 		AgentInfo: c.ClientInfo,
 	}
 
-	msg, _ = osp.EncodeMessageWithKey(rsp, osp.AgentInfoResponseKey)
+	msg, _ := osp.EncodeMessageWithKey(rsp, osp.AgentInfoResponseKey)
 	osp.SendMessage(c.Conn, msg)
 }
 
@@ -661,14 +654,8 @@ func (c *Client) CloseWithError(err error, code quic.ApplicationErrorCode) {
 	slog.Error(fmt.Sprintf("%s\n", err.Error()))
 }
 
-func (c *Client) HandleAuthCapabilities(buff []byte) {
-	capabilities := &osp.AuthCapabilities{}
-	err := cbor.Unmarshal(buff, capabilities)
-	if err != nil {
-		return
-	}
-
-	c.SetAgentCapabilities(capabilities)
+func (c *Client) HandleAuthCapabilities(cap *osp.AuthCapabilities) {
+	c.SetAgentCapabilities(cap)
 	c.capabilitiesRecv <- true
 }
 
@@ -769,11 +756,7 @@ func (c *Client) Authenticate() ([]byte, error) {
 
 	slog.Info("received spake2 handshake")
 
-	var response osp.AuthSpake2Handshake
-	err = cbor.Unmarshal(rsp, &response)
-	if err != nil {
-		return []byte{}, err
-	}
+	response := rsp.(*osp.AuthSpake2Handshake)
 	if response.PskStatus == status {
 		return []byte{}, errors.New("wrong psk status")
 	}
@@ -796,11 +779,7 @@ func (c *Client) Authenticate() ([]byte, error) {
 	rsp = <-confChan
 
 	slog.Info("received spake2 confirmation")
-	var confrsp osp.AuthSpake2Confirmation
-	err = cbor.Unmarshal(rsp, &confrsp)
-	if err != nil {
-		return []byte{}, err
-	}
+	confrsp := rsp.(*osp.AuthSpake2Confirmation)
 
 	err = s.Verify(confrsp.Bytes)
 	if err != nil {
@@ -884,12 +863,13 @@ func (c *Client) HandleMedia() error {
 				slog.Info(fmt.Sprintf("muted: %v", *cont.Muted))
 			}
 
-			var modr osp.RemotePlaybackModifyResponse
 			slog.Debug("sent modify request")
-			err := modifyRequestHandler.SendRequestWithTimeout(c.Conn, req, &modr, osp.RemotePlaybackModifyRequestKey, defaultTimeout)
+			data, err := modifyRequestHandler.SendRequestWithTimeout(c.Conn, req, osp.RemotePlaybackModifyRequestKey, defaultTimeout)
 			if err != nil {
 				return errors.Join(errors.New("error sending modify request"), err)
 			}
+
+			modr := data.(*osp.RemotePlaybackModifyResponse)
 
 			if modr.Result != osp.Success {
 				slog.Error("modify request failed")
@@ -901,11 +881,7 @@ func (c *Client) HandleMedia() error {
 			slog.Debug("sent state")
 			statechan <- c.GetState()
 		case s := <-stateEventChan:
-			event := new(osp.RemotePlaybackStateEvent)
-			err := cbor.Unmarshal(s, event)
-			if err != nil {
-				return errors.Join(errors.New("error unmarshalling state event"), err)
-			}
+			event := s.(*osp.RemotePlaybackStateEvent)
 
 			statechan <- event.State
 			c.MergeState(event.State)
@@ -913,11 +889,7 @@ func (c *Client) HandleMedia() error {
 			c.MergeState(u)
 		case term := <-terminationEventChan:
 			slog.Debug("got termination event")
-			t := osp.RemotePlaybackTerminationEvent{}
-			err := cbor.Unmarshal(term, &t)
-			if err != nil {
-				return errors.Join(errors.New("error unmarshalling termination event"), err)
-			}
+			t := term.(*osp.RemotePlaybackTerminationEvent)
 
 			slog.Info("Terminated: Reason: %d", "reason", t.Reason)
 			return nil
@@ -978,21 +950,15 @@ func (c *Client) HandleStream(stream *quic.ReceiveStream) error {
 	if stream == nil {
 		return errors.New("stream is nil")
 	}
-	buff := make([]byte, 9000)
+	s := osp.NewScanner(stream)
 	for {
-		n, err := stream.Read(buff)
-		if err != nil && !errors.Is(err, io.EOF) {
-			return err
-		}
-		if n == 0 {
-			continue
+		ok := s.Scan()
+		if !ok {
+			return s.Err()
 		}
 
-		c.MsgHandler.HandleMessage(buff[:n])
-
-		if errors.Is(err, io.EOF) {
-			return nil
-		}
+		key, data := s.GetVal()
+		c.MsgHandler.HandleData(key, data)
 	}
 }
 
